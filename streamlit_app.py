@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 import pandas as pd
 
-st.set_page_config(page_title="Bone Ninja — Auto‑Click", layout="wide")
+st.set_page_config(page_title="Bone Ninja — Click to Add Points", layout="wide")
 
 CYAN = "cyan"
 
@@ -51,20 +51,18 @@ if "poly_points" not in ss: ss.poly_points: List[Tuple[float,float]] = []
 if "ruler_points" not in ss: ss.ruler_points: List[Tuple[float,float]] = []
 if "cora_pt" not in ss: ss.cora_pt = None
 if "click_count" not in ss: ss.click_count = 0
+if "last_xy" not in ss: ss.last_xy = None
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
 st.sidebar.markdown("""
-1. Upload image
-2. Pick a tool (Polygon / CORA / Ruler)
-3. **Just click on the image** — points are auto-added
-4. Adjust ΔX / ΔY / Rotate
-5. Export
+**Single‑click on the image** to add a point to the active tool.  
+No drawing cursor appears — just click.
 """)
 
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
-tool = st.sidebar.radio("Tool", ["Polygon","CORA","Ruler"], horizontal=True)
-segment_choice = st.sidebar.radio("Segment to move", ["distal","proximal"], horizontal=True)
+tool = st.sidebar.radio("Active tool", ["Polygon","CORA","Ruler"], horizontal=True, index=0)
+segment_choice = st.sidebar.radio("Segment to move", ["distal","proximal"], horizontal=True, index=0)
 
 st.sidebar.subheader("Translation")
 dx = st.sidebar.slider("ΔX (px)", -1000, 1000, 0, 1)
@@ -72,18 +70,17 @@ dy = st.sidebar.slider("ΔY (px)", -1000, 1000, 0, 1)
 st.sidebar.subheader("Rotation")
 rotate_deg = st.sidebar.slider("Rotate (deg)", -180, 180, 0, 1)
 
-colB1, colB2, colB3 = st.sidebar.columns(3)
-with colB1:
+c1, c2, c3 = st.sidebar.columns(3)
+with c1:
     if st.button("Undo"):
         if tool == "Polygon" and ss.poly_points: ss.poly_points.pop()
         elif tool == "Ruler" and ss.ruler_points: ss.ruler_points.pop()
         elif tool == "CORA": ss.cora_pt = None
-with colB2:
+with c2:
     if st.button("Clear all"):
-        ss.poly_points.clear(); ss.ruler_points.clear(); ss.cora_pt=None
-with colB3:
-    if st.button("Close polygon"):
-        pass  # visual closure handled by drawing when >=3 points
+        ss.poly_points.clear(); ss.ruler_points.clear(); ss.cora_pt=None; ss.click_count=0
+with c3:
+    st.write("")
 
 if uploaded is None:
     st.info("Upload an image to begin."); st.stop()
@@ -114,33 +111,33 @@ if ss.cora_pt:
     fig.add_trace(go.Scatter(x=[ss.cora_pt[0]], y=[ss.cora_pt[1]], mode="markers",
                              marker=dict(size=10, symbol="circle"), name="CORA"))
 
-st.caption("Click on the image. New clicks are automatically added to the active tool.")
-events = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_autoclick")
+config = {"displayModeBar": False}  # hide modebar to avoid confusion
 
-# Auto-append any new clicks
-if events and len(events) > ss.click_count:
-    new = events[ss.click_count:]  # process only new ones
-    for ev in new:
-        if "x" in ev and "y" in ev:
-            pt = (float(ev["x"]), float(ev["y"]))
-            if tool == "Polygon":
-                ss.poly_points.append(pt)
-            elif tool == "CORA":
-                ss.cora_pt = pt
-            elif tool == "Ruler":
-                if len(ss.ruler_points) >= 2:
-                    ss.ruler_points.clear()
-                ss.ruler_points.append(pt)
-    ss.click_count = len(events)
+evts = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_clicks_now")
+if evts:
+    pt = (float(evts[-1]["x"]), float(evts[-1]["y"]))
+    ss.last_xy = pt
+    if tool == "Polygon":
+        ss.poly_points.append(pt)
+    elif tool == "CORA":
+        ss.cora_pt = pt
+    elif tool == "Ruler":
+        if len(ss.ruler_points) >= 2: ss.ruler_points.clear()
+        ss.ruler_points.append(pt)
+
+# Coordinates feedback
+if ss.last_xy:
+    st.success(f"Last click: x={ss.last_xy[0]:.1f}, y={ss.last_xy[1]:.1f} → added to {tool}")
+
+st.plotly_chart(fig, use_container_width=True, config=config)
 
 # Measurements
 st.subheader("Measurements")
-msg = ""
 if len(ss.ruler_points) == 2:
     px = length_of_line(*ss.ruler_points)
-    msg += f"Ruler: {px:.2f} px"
-if msg: st.info(msg)
-else: st.caption("Add a 2‑point ruler using the Ruler tool.")
+    st.info(f"Ruler: {px:.2f} px")
+else:
+    st.caption("Use Ruler tool and click two points.")
 
 # Transform preview + export
 st.header("Preview and Export")
@@ -180,4 +177,4 @@ if ss.poly_points and ss.cora_pt:
     composed.save(buf, format="PNG")
     st.download_button("Download transformed image (PNG)", data=buf.getvalue(), file_name="osteotomy_transformed.png", mime="image/png")
 else:
-    st.info("Add polygon (≥3 points) and CORA by clicking on the image.")
+    st.info("Click to add polygon points (≥3) and set CORA.")
