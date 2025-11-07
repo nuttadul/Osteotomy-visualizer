@@ -1,6 +1,6 @@
 
 import io
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 import pandas as pd
 
-st.set_page_config(page_title="Bone Ninja — Click Mode", layout="wide")
+st.set_page_config(page_title="Bone Ninja — Auto‑Click", layout="wide")
 
 CYAN = "cyan"
 
@@ -42,13 +42,6 @@ def paste_with_mask(base: Image.Image, overlay: Image.Image, mask: Image.Image) 
     out.paste(overlay, (0,0), mask)
     return out
 
-def angle_from_three_points(a, b, c) -> float:
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-12)
-    cosang = np.clip(cosang, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cosang)))
-
 def length_of_line(p1, p2) -> float:
     return float(np.linalg.norm(np.array(p2) - np.array(p1)))
 
@@ -56,15 +49,15 @@ def length_of_line(p1, p2) -> float:
 ss = st.session_state
 if "poly_points" not in ss: ss.poly_points: List[Tuple[float,float]] = []
 if "ruler_points" not in ss: ss.ruler_points: List[Tuple[float,float]] = []
-if "angle_points" not in ss: ss.angle_points: List[Tuple[float,float]] = []
 if "cora_pt" not in ss: ss.cora_pt = None
+if "click_count" not in ss: ss.click_count = 0
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
 st.sidebar.markdown("""
 1. Upload image
-2. Choose a tool (Polygon / CORA / Ruler)
-3. Click on image to add points (use the buttons to commit/undo)
+2. Pick a tool (Polygon / CORA / Ruler)
+3. **Just click on the image** — points are auto-added
 4. Adjust ΔX / ΔY / Rotate
 5. Export
 """)
@@ -79,9 +72,21 @@ dy = st.sidebar.slider("ΔY (px)", -1000, 1000, 0, 1)
 st.sidebar.subheader("Rotation")
 rotate_deg = st.sidebar.slider("Rotate (deg)", -180, 180, 0, 1)
 
+colB1, colB2, colB3 = st.sidebar.columns(3)
+with colB1:
+    if st.button("Undo"):
+        if tool == "Polygon" and ss.poly_points: ss.poly_points.pop()
+        elif tool == "Ruler" and ss.ruler_points: ss.ruler_points.pop()
+        elif tool == "CORA": ss.cora_pt = None
+with colB2:
+    if st.button("Clear all"):
+        ss.poly_points.clear(); ss.ruler_points.clear(); ss.cora_pt=None
+with colB3:
+    if st.button("Close polygon"):
+        pass  # visual closure handled by drawing when >=3 points
+
 if uploaded is None:
-    st.info("Upload an image to begin.")
-    st.stop()
+    st.info("Upload an image to begin."); st.stop()
 
 base_img = pil_from_bytes(uploaded.getvalue())
 W, H = base_img.size
@@ -91,7 +96,7 @@ fig = go.Figure()
 fig.update_xaxes(range=[0, W], constrain="domain", visible=False)
 fig.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False)
 fig.add_layout_image(dict(source=base_img, xref="x", yref="y", x=0, y=0, sizex=W, sizey=H, sizing="stretch", layer="below"))
-fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), dragmode="pan")
+fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), dragmode="pan", clickmode="event+select")
 
 # Draw overlays so far
 if ss.poly_points:
@@ -109,40 +114,24 @@ if ss.cora_pt:
     fig.add_trace(go.Scatter(x=[ss.cora_pt[0]], y=[ss.cora_pt[1]], mode="markers",
                              marker=dict(size=10, symbol="circle"), name="CORA"))
 
-st.caption("Click on the image, then use the buttons to apply the click to the active tool.")
-events = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_clicks")
+st.caption("Click on the image. New clicks are automatically added to the active tool.")
+events = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_autoclick")
 
-last_click = None
-if events:
-    # streamlit-plotly-events returns a list of dicts with 'x' and 'y'
-    last_click = (float(events[-1]["x"]), float(events[-1]["y"]))
-
-colA, colB, colC, colD = st.columns(4)
-with colA:
-    if st.button("Use last click"):
-        if last_click:
+# Auto-append any new clicks
+if events and len(events) > ss.click_count:
+    new = events[ss.click_count:]  # process only new ones
+    for ev in new:
+        if "x" in ev and "y" in ev:
+            pt = (float(ev["x"]), float(ev["y"]))
             if tool == "Polygon":
-                ss.poly_points.append(last_click)
+                ss.poly_points.append(pt)
             elif tool == "CORA":
-                ss.cora_pt = last_click
+                ss.cora_pt = pt
             elif tool == "Ruler":
                 if len(ss.ruler_points) >= 2:
                     ss.ruler_points.clear()
-                ss.ruler_points.append(last_click)
-with colB:
-    if st.button("Undo last"):
-        if tool == "Polygon" and ss.poly_points:
-            ss.poly_points.pop()
-        elif tool == "Ruler" and ss.ruler_points:
-            ss.ruler_points.pop()
-        elif tool == "CORA":
-            ss.cora_pt = None
-with colC:
-    if st.button("Close polygon"):
-        pass  # visual closure happens automatically when >=3 points
-with colD:
-    if st.button("Clear all"):
-        ss.poly_points.clear(); ss.ruler_points.clear(); ss.angle_points.clear(); ss.cora_pt=None
+                ss.ruler_points.append(pt)
+    ss.click_count = len(events)
 
 # Measurements
 st.subheader("Measurements")
@@ -151,7 +140,7 @@ if len(ss.ruler_points) == 2:
     px = length_of_line(*ss.ruler_points)
     msg += f"Ruler: {px:.2f} px"
 if msg: st.info(msg)
-else: st.caption("Add a 2-point ruler using the Ruler tool.")
+else: st.caption("Add a 2‑point ruler using the Ruler tool.")
 
 # Transform preview + export
 st.header("Preview and Export")
@@ -181,7 +170,8 @@ if ss.poly_points and ss.cora_pt:
 
     st.image(composed, caption=f"Transformed ({segment_choice} moved)", use_container_width=True)
 
-    params = dict(mode=segment_choice, dx=dx, dy=dy, rotate_deg=rotate_deg, polygon_points=poly_pts, cora=ss.cora_pt)
+    params = dict(mode=segment_choice, dx=dx, dy=dy, rotate_deg=rotate_deg,
+                  polygon_points=poly_pts, cora=ss.cora_pt)
     df_params = pd.DataFrame([params])
     st.download_button("Download parameters CSV", data=df_params.to_csv(index=False).encode("utf-8"),
                        file_name="osteotomy_params.csv", mime="text/csv")
@@ -190,4 +180,4 @@ if ss.poly_points and ss.cora_pt:
     composed.save(buf, format="PNG")
     st.download_button("Download transformed image (PNG)", data=buf.getvalue(), file_name="osteotomy_transformed.png", mime="image/png")
 else:
-    st.info("Add polygon (≥3 points) and CORA to preview transform.")
+    st.info("Add polygon (≥3 points) and CORA by clicking on the image.")
