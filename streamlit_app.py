@@ -9,7 +9,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+
+# Attempt to import drawable canvas; fallback if unavailable
+CANVAS_AVAILABLE = True
+try:
+    from streamlit_drawable_canvas import st_canvas
+except Exception as e:
+    CANVAS_AVAILABLE = False
+
 import pandas as pd
 
 st.set_page_config(page_title="Bone Ninja (Streamlit Edition)", layout="wide")
@@ -153,7 +160,9 @@ with col_left:
 
     display_img = base_img.resize((canvas_width, canvas_height), Image.BICUBIC)
 
-    canvas_result = st_canvas(
+    canvas_result = None
+    if CANVAS_AVAILABLE:
+        canvas_result = st_canvas(
         fill_color="rgba(0, 0, 0, 0)",
         stroke_width=stroke_width,
         stroke_color=stroke_color,
@@ -166,6 +175,52 @@ with col_left:
         key=f"canvas_{tool}",
         display_toolbar=True,
     )
+
+
+if not CANVAS_AVAILABLE:
+    st.warning("Drawable canvas component is not installed on the server. Switching to fallback mode (paste points).")
+    st.markdown("**How to use (fallback):** Paste comma-separated points (x,y) in image pixel coordinates. Use the preview to verify.")
+    with st.expander("Paste polygon points (for osteotomy) — one point per line, like `120,340`"):
+        poly_text = st.text_area("Polygon points", value="", height=150, key="poly_txt")
+    with st.expander("Paste ruler points (optional) — two lines, `x,y` each"):
+        ruler_text = st.text_area("Ruler points", value="", height=80, key="ruler_txt")
+    with st.expander("Paste angle points (optional) — three lines, `x,y` each"):
+        angle_text = st.text_area("Angle points", value="", height=120, key="angle_txt")
+
+    def parse_points(txt, expected_min=0):
+        pts = []
+        for line in txt.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                x_str, y_str = line.split(",")
+                pts.append((float(x_str), float(y_str)))
+            except Exception:
+                pass
+        return pts
+
+    # Build display preview with optional overlays
+    disp = base_img.copy()
+    draw = ImageDraw.Draw(disp, "RGBA")
+    poly_pts = parse_points(poly_text)
+    if len(poly_pts) >= 3:
+        draw.polygon(poly_pts, outline=(0,255,255,255), width=2)
+    rp = parse_points(ruler_text)
+    if len(rp) >= 2:
+        draw.line([rp[0], rp[1]], fill=(0,255,0,255), width=2)
+    ap = parse_points(angle_text)
+    if len(ap) >= 3:
+        draw.line([ap[0], ap[1]], fill=(255,165,0,255), width=2)
+        draw.line([ap[1], ap[2]], fill=(255,165,0,255), width=2)
+
+    st.image(disp, caption="Fallback preview (overlays only)", use_container_width=True)
+
+    # Export/transforms using parsed points (reusing variables used later)
+    polygon_points_display = poly_pts
+    line_points = rp[:2]
+    angle_points = ap[:3]
+    poly_ok = len(polygon_points_display) >= 3
 
 with col_right:
     st.header("Preview and Export")
