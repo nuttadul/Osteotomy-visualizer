@@ -10,7 +10,7 @@ import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 import pandas as pd
 
-st.set_page_config(page_title="Bone Ninja — Streamlit (click tools + hinge)", layout="wide")
+st.set_page_config(page_title="Bone Ninja — Click tools (fast)", layout="wide")
 
 # Colors (RGBA)
 CYAN = (0, 255, 255, 255)
@@ -19,7 +19,7 @@ GREEN = (0, 200, 0, 255)
 BLUE = (66, 133, 244, 255)
 MAGENTA = (221, 0, 221, 255)
 ORANGE = (255, 165, 0, 255)
-GREY = (180,180,180,255)
+YELLOW = (255, 255, 0, 255)
 
 @dataclass
 class TransformParams:
@@ -67,6 +67,19 @@ def centroid_of_polygon(pts: List[Tuple[float,float]]) -> Optional[Tuple[float,f
 def length_of_line(p1, p2) -> float:
     return float(np.linalg.norm(np.array(p2) - np.array(p1)))
 
+def rotate_point(p, center, angle_deg):
+    ang = np.deg2rad(angle_deg)
+    c, s = np.cos(ang), np.sin(ang)
+    x, y = p; cx, cy = center
+    x0, y0 = x - cx, y - cy
+    xr = x0*c - y0*s + cx
+    yr = x0*s + y0*c + cy
+    return (float(xr), float(yr))
+
+def transform_points(points, dx, dy, angle_deg, center):
+    return [ (rotate_point((px,py), center, angle_deg)[0] + dx,
+              rotate_point((px,py), center, angle_deg)[1] + dy) for (px,py) in points ]
+
 # ---------------- State ----------------
 ss = st.session_state
 def init_state():
@@ -77,17 +90,13 @@ def init_state():
     ss.setdefault("prox_line", [])   # up to 2 points
     ss.setdefault("dist_line", [])   # up to 2 points
     ss.setdefault("last_click", None)
+    ss.setdefault("display_width", 1000)
 init_state()
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
 st.sidebar.markdown("""
-Click to add points. This build supports:
-- **Polygon** (osteotomy)
-- **CORA** center
-- **HINGE** (rotation center — **recommended**)
-- **Proximal line** and **Distal line**
-- **Ruler** (2‑point)
+Click to add points. This build improves responsiveness and keeps lines persistent.
 """)
 
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
@@ -96,6 +105,9 @@ segment_choice = st.sidebar.radio("Segment to move", ["distal","proximal"], hori
 
 st.sidebar.subheader("Rotation center")
 center_mode = st.sidebar.radio("Use center from", ["HINGE","CORA","Polygon centroid"], index=0, horizontal=False)
+
+st.sidebar.subheader("Display")
+ss.display_width = st.sidebar.slider("Preview width (px)", 600, 1600, ss.display_width, 50)
 
 st.sidebar.subheader("Translation")
 dx = st.sidebar.slider("ΔX (px)", -1000, 1000, 0, 1)
@@ -124,59 +136,75 @@ with b5:
 if uploaded is None:
     st.info("Upload an image to begin."); st.stop()
 
-base_img = pil_from_bytes(uploaded.getvalue())
-W, H = base_img.size
+# Cache image decode to speed reruns
+@st.cache_data(show_spinner=False)
+def load_image(data: bytes):
+    img = pil_from_bytes(data)
+    return img, img.size
 
-# --------- Draw overlays for preview (also the clickable image) ---------
-preview = base_img.copy()
-draw = ImageDraw.Draw(preview)
+base_img, (W, H) = load_image(uploaded.getvalue())
 
-# polygon
-if len(ss.poly_points) >= 1:
-    draw.line(ss.poly_points, fill=CYAN, width=2, joint="curve")
-    if len(ss.poly_points) >= 3:
-        draw.line([*ss.poly_points, ss.poly_points[0]], fill=CYAN, width=2)
+# Scale for display
+scale = ss.display_width / float(W)
+disp_size = (ss.display_width, int(H*scale))
 
-# lines (proximal in BLUE, distal in MAGENTA)
-if len(ss.prox_line) == 1:
-    p = ss.prox_line[0]
-    draw.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=BLUE)
-elif len(ss.prox_line) == 2:
-    draw.line(ss.prox_line, fill=BLUE, width=3)
-    for p in ss.prox_line:
-        draw.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=BLUE)
-if len(ss.dist_line) == 1:
-    p = ss.dist_line[0]
-    draw.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=MAGENTA)
-elif len(ss.dist_line) == 2:
-    draw.line(ss.dist_line, fill=MAGENTA, width=3)
-    for p in ss.dist_line:
-        draw.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=MAGENTA)
+def draw_overlay(img: Image.Image) -> Image.Image:
+    preview = img.copy()
+    d = ImageDraw.Draw(preview)
 
-# ruler
-if len(ss.ruler_points) == 1:
-    r1 = ss.ruler_points[0]
-    draw.ellipse([r1[0]-3, r1[1]-3, r1[0]+3, r1[1]+3], fill=RED)
-elif len(ss.ruler_points) == 2:
-    draw.line(ss.ruler_points, fill=RED, width=2)
-    for r in ss.ruler_points:
-        draw.ellipse([r[0]-3, r[1]-3, r[0]+3, r[1]+3], fill=RED)
+    # Polygon
+    if len(ss.poly_points) >= 1:
+        pts = ss.poly_points
+        d.line(pts, fill=CYAN, width=2, joint="curve")
+        if len(pts) >= 3:
+            d.line([*pts, pts[0]], fill=CYAN, width=2)
 
-# centers
-if ss.cora_pt:
-    x,y = ss.cora_pt
-    draw.ellipse([x-6,y-6,x+6,y+6], outline=GREEN, width=2)
-if ss.hinge_pt:
-    x,y = ss.hinge_pt
-    draw.ellipse([x-7,y-7,x+7,y+7], outline=ORANGE, width=3)
-    draw.line([(x-12,y),(x+12,y)], fill=ORANGE, width=1)
-    draw.line([(x,y-12),(x,y+12)], fill=ORANGE, width=1)
+    # Proximal/Distal lines (persistent)
+    if len(ss.prox_line) == 1:
+        p = ss.prox_line[0]; d.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=BLUE)
+    elif len(ss.prox_line) == 2:
+        d.line(ss.prox_line, fill=BLUE, width=3)
+        for p in ss.prox_line:
+            d.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=BLUE)
+
+    if len(ss.dist_line) == 1:
+        p = ss.dist_line[0]; d.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=MAGENTA)
+    elif len(ss.dist_line) == 2:
+        d.line(ss.dist_line, fill=MAGENTA, width=3)
+        for p in ss.dist_line:
+            d.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=MAGENTA)
+
+    # Ruler
+    if len(ss.ruler_points) == 1:
+        r1 = ss.ruler_points[0]; d.ellipse([r1[0]-3, r1[1]-3, r1[0]+3, r1[1]+3], fill=RED)
+    elif len(ss.ruler_points) == 2:
+        d.line(ss.ruler_points, fill=RED, width=2)
+        for r in ss.ruler_points:
+            d.ellipse([r[0]-3, r[1]-3, r[0]+3, r[1]+3], fill=RED)
+
+    # Centers
+    if ss.cora_pt:
+        x,y = ss.cora_pt; d.ellipse([x-6,y-6,x+6,y+6], outline=GREEN, width=2)
+    if ss.hinge_pt:
+        x,y = ss.hinge_pt
+        d.ellipse([x-7,y-7,x+7,y+7], outline=ORANGE, width=3)
+        d.line([(x-12,y),(x+12,y)], fill=ORANGE, width=1)
+        d.line([(x,y-12),(x,y+12)], fill=ORANGE, width=1)
+
+    return preview
 
 st.caption("Click on the image below to add to the active tool.")
-res = streamlit_image_coordinates(preview, key="imgclick_v2", width=min(1100, W))
+preview = draw_overlay(base_img)
+preview_disp = preview.resize(disp_size, Image.BILINEAR)
+res = streamlit_image_coordinates(preview_disp, key="imgclick_fast", width=disp_size[0])
+
+# Map display coords back to original
+def to_orig(pt_disp):
+    return (float(pt_disp[0])/scale, float(pt_disp[1])/scale)
 
 if res is not None and "x" in res and "y" in res:
-    pt = (float(res["x"]), float(res["y"]))
+    pt0 = (float(res["x"]), float(res["y"]))
+    pt = to_orig(pt0)
     ss.last_click = pt
     if tool == "Polygon":
         ss.poly_points.append(pt)
@@ -197,37 +225,24 @@ if res is not None and "x" in res and "y" in res:
 
 # Measurements
 st.subheader("Measurements")
-meas_msgs = []
-if len(ss.ruler_points) == 2:
-    meas_msgs.append(f"Ruler: {length_of_line(*ss.ruler_points):.2f} px")
-if len(ss.prox_line) == 2:
-    meas_msgs.append(f"Proximal line length: {length_of_line(*ss.prox_line):.2f} px")
-if len(ss.dist_line) == 2:
-    meas_msgs.append(f"Distal line length: {length_of_line(*ss.dist_line):.2f} px")
-if meas_msgs:
-    for m in meas_msgs: st.info(m)
-else:
-    st.caption("Use Ruler or draw Proximal/Distal lines to see measurements.")
+meas = []
+if len(ss.ruler_points) == 2: meas.append(f"Ruler: {length_of_line(*ss.ruler_points):.2f} px")
+if len(ss.prox_line) == 2:   meas.append(f"Proximal line: {length_of_line(*ss.prox_line):.2f} px")
+if len(ss.dist_line) == 2:   meas.append(f"Distal line: {length_of_line(*ss.dist_line):.2f} px")
+for m in meas: st.info(m)
+if not meas: st.caption("Use Ruler/Proximal/Distal line tools to see measurements.")
 
 # Determine rotation center
 center = None
-if center_mode == "HINGE" and ss.hinge_pt:
-    center = ss.hinge_pt
-elif center_mode == "CORA" and ss.cora_pt:
-    center = ss.cora_pt
-elif center_mode == "Polygon centroid":
-    center = centroid_of_polygon(ss.poly_points)
-if center is None and ss.cora_pt:
-    center = ss.cora_pt
-if center is None:
-    c = centroid_of_polygon(ss.poly_points)
-    if c: center = c
+if center_mode == "HINGE" and ss.hinge_pt: center = ss.hinge_pt
+elif center_mode == "CORA" and ss.cora_pt: center = ss.cora_pt
+else:
+    center = centroid_of_polygon(ss.poly_points) or ss.cora_pt or ss.hinge_pt
 
 # Transform preview + export
 st.header("Preview and Export")
 if len(ss.poly_points) >= 3 and center is not None:
-    poly_pts = ss.poly_points
-    mask_poly = polygon_mask(base_img.size, poly_pts)
+    mask_poly = polygon_mask(base_img.size, ss.poly_points)
     mask_inv = ImageOps.invert(mask_poly)
 
     proximal_piece = Image.new("RGBA", base_img.size, (0,0,0,0))
@@ -236,20 +251,36 @@ if len(ss.poly_points) >= 3 and center is not None:
     distal_piece = paste_with_mask(distal_piece, base_img, mask_poly)
 
     moving = distal_piece if segment_choice == "distal" else proximal_piece
-    fixed = proximal_piece if segment_choice == "distal" else distal_piece
+    fixed   = proximal_piece if segment_choice == "distal" else distal_piece
 
     moved = apply_affine(moving, dx=dx, dy=dy, rot_deg=rotate_deg, center=center)
-
     composed = Image.new("RGBA", base_img.size, (0,0,0,0))
     out_img = Image.alpha_composite(Image.alpha_composite(composed, fixed), moved)
 
-    # draw overlays on top for preview (center marker)
-    preview2 = out_img.copy()
-    d2 = ImageDraw.Draw(preview2)
+    # Draw transformed distal line if distal segment moved
+    overlay = ImageDraw.Draw(out_img)
+    if segment_choice == "distal" and len(ss.dist_line) == 2:
+        p_trans = transform_points(ss.dist_line, dx, dy, rotate_deg, center)
+        overlay.line(p_trans, fill=MAGENTA, width=3)
+        for p in p_trans:
+            overlay.ellipse([p[0]-3,p[1]-3,p[0]+3,p[1]+3], fill=MAGENTA)
+    else:
+        # keep original distal line if not moving
+        if len(ss.dist_line) == 2:
+            overlay.line(ss.dist_line, fill=MAGENTA, width=3)
+
+    # Proximal line stays fixed
+    if len(ss.prox_line) == 2:
+        overlay.line(ss.prox_line, fill=BLUE, width=3)
+
+    # Show rotation center
     if center:
         x,y = center
-        d2.ellipse([x-6,y-6,x+6,y+6], outline=(255,255,0,255), width=2)
-    st.image(preview2, caption=f"Transformed around {center_mode} ({segment_choice} moved by Δ=({dx},{dy}), θ={rotate_deg}°)", use_container_width=True)
+        overlay.ellipse([x-6,y-6,x+6,y+6], outline=YELLOW, width=2)
+
+    st.image(out_img.resize(disp_size, Image.BILINEAR),
+             caption=f"Transformed around center {center} ({segment_choice} moved Δ=({dx},{dy}), θ={rotate_deg}°)",
+             use_container_width=True)
 
     # Export
     params = dict(
