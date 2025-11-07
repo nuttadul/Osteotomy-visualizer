@@ -1,5 +1,6 @@
 streamlit==1.39.0
+plotly==5.24.1
+streamlit-plotly-events==0.0.6
 Pillow==10.4.0
 numpy==1.26.4
 pandas==2.2.2
-streamlit-drawable-canvas==0.9.3
