@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 import pandas as pd
 
-st.set_page_config(page_title="Bone Ninja — Click to Add Points", layout="wide")
+st.set_page_config(page_title="Bone Ninja — Any‑Click Capture", layout="wide")
 
 CYAN = "cyan"
 
@@ -50,14 +50,13 @@ ss = st.session_state
 if "poly_points" not in ss: ss.poly_points: List[Tuple[float,float]] = []
 if "ruler_points" not in ss: ss.ruler_points: List[Tuple[float,float]] = []
 if "cora_pt" not in ss: ss.cora_pt = None
-if "click_count" not in ss: ss.click_count = 0
 if "last_xy" not in ss: ss.last_xy = None
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
 st.sidebar.markdown("""
-**Single‑click on the image** to add a point to the active tool.  
-No drawing cursor appears — just click.
+**Click anywhere on the image** to add a point to the active tool.  
+The app uses an invisible capture grid, so clicks always register.
 """)
 
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
@@ -78,7 +77,7 @@ with c1:
         elif tool == "CORA": ss.cora_pt = None
 with c2:
     if st.button("Clear all"):
-        ss.poly_points.clear(); ss.ruler_points.clear(); ss.cora_pt=None; ss.click_count=0
+        ss.poly_points.clear(); ss.ruler_points.clear(); ss.cora_pt=None
 with c3:
     st.write("")
 
@@ -93,27 +92,43 @@ fig = go.Figure()
 fig.update_xaxes(range=[0, W], constrain="domain", visible=False)
 fig.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False)
 fig.add_layout_image(dict(source=base_img, xref="x", yref="y", x=0, y=0, sizex=W, sizey=H, sizing="stretch", layer="below"))
-fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), dragmode="pan", clickmode="event+select")
+fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), clickmode="event+select")
 
-# Draw overlays so far
+# Invisible capture grid to receive clicks anywhere
+step = max(4, int(min(W, H) / 200))  # ~200x200 grid max
+xs = list(range(0, W, step))
+ys = list(range(0, H, step))
+grid_x, grid_y = np.meshgrid(xs, ys)
+fig.add_trace(go.Scatter(
+    x=grid_x.flatten(),
+    y=grid_y.flatten(),
+    mode="markers",
+    marker=dict(size=8, opacity=0.001, color="rgba(0,0,0,0.001)"),
+    hoverinfo="skip",
+    name="click-capture",
+))
+
+# Overlays
 if ss.poly_points:
-    xs, ys = zip(*ss.poly_points)
-    fig.add_trace(go.Scatter(x=list(xs)+([xs[0]] if len(xs)>=3 else []),
-                             y=list(ys)+([ys[0]] if len(ys)>=3 else []),
+    xs2, ys2 = zip(*ss.poly_points)
+    fig.add_trace(go.Scatter(x=list(xs2)+([xs2[0]] if len(xs2)>=3 else []),
+                             y=list(ys2)+([ys2[0]] if len(ys2)>=3 else []),
                              mode="lines+markers",
                              line=dict(color=CYAN, width=2),
                              marker=dict(size=6, color=CYAN),
                              name="polygon"))
 if ss.ruler_points:
-    xs, ys = zip(*ss.ruler_points)
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="ruler"))
+    rx, ry = zip(*ss.ruler_points)
+    fig.add_trace(go.Scatter(x=rx, y=ry, mode="lines+markers", name="ruler"))
 if ss.cora_pt:
     fig.add_trace(go.Scatter(x=[ss.cora_pt[0]], y=[ss.cora_pt[1]], mode="markers",
                              marker=dict(size=10, symbol="circle"), name="CORA"))
 
-config = {"displayModeBar": False}  # hide modebar to avoid confusion
+# Hide modebar
+config = {"displayModeBar": False, "scrollZoom": False}
 
-evts = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_clicks_now")
+# Capture clicks (nearest capture‑grid point)
+evts = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_clicks_grid")
 if evts:
     pt = (float(evts[-1]["x"]), float(evts[-1]["y"]))
     ss.last_xy = pt
@@ -125,11 +140,11 @@ if evts:
         if len(ss.ruler_points) >= 2: ss.ruler_points.clear()
         ss.ruler_points.append(pt)
 
-# Coordinates feedback
-if ss.last_xy:
-    st.success(f"Last click: x={ss.last_xy[0]:.1f}, y={ss.last_xy[1]:.1f} → added to {tool}")
-
 st.plotly_chart(fig, use_container_width=True, config=config)
+
+# Feedback
+if ss.last_xy:
+    st.success(f"Last point → x={ss.last_xy[0]:.1f}, y={ss.last_xy[1]:.1f} ({tool})")
 
 # Measurements
 st.subheader("Measurements")
@@ -162,10 +177,8 @@ if ss.poly_points and ss.cora_pt:
     moved = apply_affine(moving, dx=dx, dy=dy, rot_deg=rotate_deg, center=center)
 
     composed = Image.new("RGBA", base_img.size, (0,0,0,0))
-    composed = Image.alpha_composite(composed, fixed)
-    composed = Image.alpha_composite(composed, moved)
-
-    st.image(composed, caption=f"Transformed ({segment_choice} moved)", use_container_width=True)
+    st.image(Image.alpha_composite(Image.alpha_composite(composed, fixed), moved),
+             caption=f"Transformed ({segment_choice} moved)", use_container_width=True)
 
     params = dict(mode=segment_choice, dx=dx, dy=dy, rotate_deg=rotate_deg,
                   polygon_points=poly_pts, cora=ss.cora_pt)
@@ -174,7 +187,9 @@ if ss.poly_points and ss.cora_pt:
                        file_name="osteotomy_params.csv", mime="text/csv")
 
     buf = io.BytesIO()
-    composed.save(buf, format="PNG")
-    st.download_button("Download transformed image (PNG)", data=buf.getvalue(), file_name="osteotomy_transformed.png", mime="image/png")
+    out_img = Image.alpha_composite(Image.alpha_composite(composed, fixed), moved)
+    out_img.save(buf, format="PNG")
+    st.download_button("Download transformed image (PNG)", data=buf.getvalue(),
+                       file_name="osteotomy_transformed.png", mime="image/png")
 else:
     st.info("Click to add polygon points (≥3) and set CORA.")
