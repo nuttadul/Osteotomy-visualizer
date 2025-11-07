@@ -1,23 +1,44 @@
 
 import io
+import math
 from dataclasses import dataclass, asdict
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
+
 import streamlit as st
 
-st.set_page_config(page_title="Bone Ninja — Safe Mode", layout="wide")
+# Try to import the drawable canvas; if not present, show a clear error.
+try:
+    from streamlit_drawable_canvas import st_canvas
+except Exception as e:
+    st.error("streamlit-drawable-canvas is not installed. Please use the provided requirements.txt (GitHub install).")
+    st.stop()
 
+st.set_page_config(page_title="Ilizarov 2D — Streamlit", layout="wide")
+
+# ---------------- Data structures ----------------
 @dataclass
-class TransformParams:
-    mode: str  # "proximal" or "distal"
-    dx: float
-    dy: float
-    rotate_deg: float
+class Line2D:
+    p1: Tuple[float,float]
+    p2: Tuple[float,float]
 
-def pil_from_bytes(file_bytes) -> Image.Image:
-    return Image.open(io.BytesIO(file_bytes)).convert("RGBA")
+    def as_array(self):
+        return (np.array(self.p1, dtype=float), np.array(self.p2, dtype=float))
+
+def line_dir(P1, P2):
+    v = P2 - P1
+    n = np.linalg.norm(v) + 1e-12
+    return v / n
+
+def rotate_point(P, H, theta_rad):
+    px, py = P
+    hx, hy = H
+    c, s = math.cos(theta_rad), math.sin(theta_rad)
+    x = c*(px-hx) - s*(py-hy) + hx
+    y = s*(px-hx) + c*(py-hy) + hy
+    return (x, y)
 
 def polygon_mask(size: Tuple[int,int], points: List[Tuple[float,float]]) -> Image.Image:
     mask = Image.new("L", size, 0)
@@ -25,144 +46,198 @@ def polygon_mask(size: Tuple[int,int], points: List[Tuple[float,float]]) -> Imag
         ImageDraw.Draw(mask).polygon(points, fill=255, outline=255)
     return mask
 
-def apply_affine(img: Image.Image, dx: float, dy: float, rot_deg: float, center: Tuple[float,float]) -> Image.Image:
-    rotated = img.rotate(rot_deg, resample=Image.BICUBIC, center=center, expand=False)
-    canvas = Image.new("RGBA", img.size, (0,0,0,0))
-    canvas.alpha_composite(rotated, (int(round(dx)), int(round(dy))))
-    return canvas
+def split_image_by_polygon(img: Image.Image, poly_pts: List[Tuple[float,float]]):
+    mask_poly = polygon_mask(img.size, poly_pts)
+    mask_inv = ImageOps.invert(mask_poly)
+    outer = Image.new("RGBA", img.size, (0,0,0,0))
+    inner = Image.new("RGBA", img.size, (0,0,0,0))
+    outer.paste(img, (0,0), mask_inv)
+    inner.paste(img, (0,0), mask_poly)
+    return outer, inner, mask_inv, mask_poly
 
-def paste_with_mask(base: Image.Image, overlay: Image.Image, mask: Image.Image) -> Image.Image:
-    out = base.copy()
-    out.paste(overlay, (0,0), mask)
-    return out
+def center_of_mask(mask_img: Image.Image):
+    arr = np.array(mask_img, dtype=float) / 255.0
+    ys, xs = np.nonzero(arr > 0.5)
+    if len(xs) == 0:
+        return None
+    return (float(xs.mean()), float(ys.mean()))
 
-def parse_points(text: str) -> List[Tuple[float,float]]:
-    pts = []
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "," in line:
-            a, b = line.split(",", 1)
-        elif "\t" in line:
-            a, b = line.split("\t", 1)
-        else:
-            parts = line.split()
-            if len(parts) >= 2:
-                a, b = parts[0], parts[1]
-            else:
-                continue
-        try:
-            pts.append((float(a), float(b)))
-        except:
-            continue
-    return pts
+# ---------------- Sidebar workflow ----------------
+st.sidebar.title("Workflow")
+st.sidebar.markdown("""
+1. Upload X-ray/photo
+2. Calibrate px↔mm (optional) using a line
+3. Place **Proximal line** and **Distal line** (yellow) with the Line tool
+4. Place **CORA** using a small circle or by entering coordinates
+5. Draw **Osteotomy polygon** with the Polygon tool
+6. Rotate the distal segment around CORA
+""")
 
-def length_of_line(p1, p2) -> float:
-    return float(np.linalg.norm(np.array(p2) - np.array(p1)))
+uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
+canvas_w = st.sidebar.slider("Canvas width (px)", 600, 1800, 1000, 10)
+stroke_w = st.sidebar.slider("Stroke width", 1, 6, 2)
+px_per_mm = st.sidebar.number_input("Calibration px/mm (optional)", min_value=0.0, value=0.0, step=0.01,
+                                    help="Enter directly or draw a calibration line then click 'Use last line for calibration'.")
 
-def angle_from_three_points(a, b, c) -> float:
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-12)
-    cosang = np.clip(cosang, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cosang)))
+theta_deg = st.sidebar.slider("Rotate distal (deg)", -180, 180, 0, 1, help="Rotation around CORA")
+reset_btn = st.sidebar.button("Reset rotation")
 
-st.title("Bone Ninja — Safe Mode (no extra components)")
-st.write("Paste polygon and measurement points. This version avoids any custom widgets so it will run everywhere.")
+# ---------------- State ----------------
+if "theta_deg" not in st.session_state:
+    st.session_state.theta_deg = 0
+if reset_btn:
+    st.session_state.theta_deg = 0
+else:
+    st.session_state.theta_deg = theta_deg
 
-uploaded = st.file_uploader("Upload image (png/jpg/tif)", type=["png","jpg","jpeg","tif","tiff"])
-if not uploaded:
-    st.stop()
+# ---------------- Main layout ----------------
+colL, colR = st.columns([1.3, 1])
+with colL:
+    st.header("Canvas")
+    if not uploaded:
+        st.info("Upload an image to begin.")
+        st.stop()
 
-img = pil_from_bytes(uploaded.getvalue())
-W, H = img.size
-st.image(img, caption=f"Original ({W}×{H})", use_container_width=True)
+    # Prepare image and scaled canvas size (keep aspect)
+    base_img = Image.open(io.BytesIO(uploaded.getvalue())).convert("RGBA")
+    W, H = base_img.size
+    scale = canvas_w / W
+    canvas_h = int(H * scale)
+    display_img = base_img.resize((canvas_w, canvas_h), Image.BICUBIC)
 
-st.header("Polygon (osteotomy lasso)")
-poly_text = st.text_area("Enter points (x,y) one per line", height=160, placeholder="120,340\n180,360\n210,420\n150,450")
-poly_pts = parse_points(poly_text)
-st.caption(f"{len(poly_pts)} points parsed")
+    # Canvas with drawing tools
+    canvas_result = st_canvas(
+        fill_color="rgba(0,0,0,0)",
+        stroke_color="#00FFFF",
+        stroke_width=stroke_w,
+        background_image=display_img,
+        update_streamlit=True,
+        height=canvas_h,
+        width=canvas_w,
+        drawing_mode="transform",  # we'll allow toolbox; user picks line/polygon/circle
+        display_toolbar=True,
+        key="main_canvas",
+    )
 
-col_m, col_t = st.columns(2)
-with col_m:
-    mode = st.radio("Segment to move", ["distal","proximal"], horizontal=True)
-with col_t:
-    dx = st.number_input("ΔX (px)", value=0.0, step=1.0)
-    dy = st.number_input("ΔY (px)", value=0.0, step=1.0)
-    rot = st.number_input("Rotate (deg)", value=0.0, step=1.0)
+with colR:
+    st.header("Preview")
+    # parse objects
+    objs = canvas_result.json_data["objects"] if canvas_result.json_data and "objects" in canvas_result.json_data else []
 
-st.header("Measurements (optional)")
-ruler_text = st.text_input("Ruler points (x1,y1 ; x2,y2)", value="")
-angle_text = st.text_input("Angle points (x1,y1 ; x2,y2 ; x3,y3)", value="")
-cal_mm = st.number_input("Calibration: known distance (mm) for current ruler", value=0.0, step=0.1)
+    def to_base(px, py):
+        return (px/scale, py/scale)
 
-# Parse measurements
-def parse_inline_pairs(s: str) -> List[Tuple[float,float]]:
-    s = s.strip()
-    if not s:
-        return []
-    try:
-        parts = [p.strip() for p in s.split(";")]
-        def pp(x):
-            a,b = x.split(",")
-            return (float(a), float(b))
-        return [pp(p) for p in parts if p]
-    except Exception:
-        return []
+    proximal_line: Optional[Line2D] = None
+    distal_line: Optional[Line2D] = None
+    cora_pt: Optional[Tuple[float,float]] = None
+    polygon_pts: List[Tuple[float,float]] = []
+    calib_line: Optional[Line2D] = None
 
-ruler_pts = parse_inline_pairs(ruler_text)
-angle_pts = parse_inline_pairs(angle_text)
+    # Heuristic mapping based on object order and colors: user can label via checklist below too
+    # We'll collect all lines and polygons and let the controls choose which one is which.
+    lines: List[Line2D] = []
+    polys: List[List[Tuple[float,float]]] = []
+    circles: List[Tuple[float,float]] = []
 
-if len(ruler_pts) == 2:
-    dpx = length_of_line(*ruler_pts)
-    msg = f"Ruler: {dpx:.2f} px"
-    if cal_mm > 0:
-        px_per_mm = dpx / cal_mm
-        msg += f"  ({cal_mm:.2f} mm → {px_per_mm:.3f} px/mm)"
-    st.info(msg)
+    for ob in objs:
+        typ = ob.get("type")
+        left = float(ob.get("left", 0))
+        top  = float(ob.get("top", 0))
+        if typ == "line":
+            x1 = left; y1 = top
+            x2 = left + float(ob.get("width", 0))
+            y2 = top + float(ob.get("height", 0))
+            p1 = to_base(x1, y1); p2 = to_base(x2, y2)
+            lines.append(Line2D(p1, p2))
+        elif typ == "polygon":
+            pts = []
+            for pt in ob.get("points", []):
+                x = left + float(pt.get("x", 0))
+                y = top  + float(pt.get("y", 0))
+                pts.append(to_base(x, y))
+            if len(pts) >= 3:
+                polys.append(pts)
+        elif typ == "circle":
+            # approximate center from left/top + radius
+            rx = float(ob.get("rx", ob.get("radius", 0)))
+            ry = float(ob.get("ry", ob.get("radius", 0)))
+            cx = left + rx
+            cy = top + ry
+            circles.append(to_base(cx, cy))
 
-if len(angle_pts) == 3:
-    ang = angle_from_three_points(angle_pts[0], angle_pts[1], angle_pts[2])
-    st.info(f"Angle: {ang:.2f}°")
+    # Selection controls
+    if lines:
+        idx_prox = st.selectbox("Choose proximal line", list(range(len(lines))), format_func=lambda i: f"Line {i+1}")
+        proximal_line = lines[idx_prox]
+    if lines:
+        idx_dist = st.selectbox("Choose distal line (yellow)", list(range(len(lines))), index=min(1, len(lines)-1),
+                                format_func=lambda i: f"Line {i+1}")
+        distal_line = lines[idx_dist]
+    if lines:
+        idx_cal = st.selectbox("Choose calibration line (optional)", ["None"] + [f"Line {i+1}" for i in range(len(lines))])
+        if idx_cal != "None":
+            calib_line = lines[int(idx_cal.split()[-1]) - 1]
+            if px_per_mm == 0.0:
+                # try to set px/mm from this line if user provided mm below
+                pass
 
-st.header("Preview and Export")
-if len(poly_pts) < 3:
-    st.warning("Enter at least 3 polygon points to preview the transform.")
-    st.stop()
+    if circles:
+        idx_cora = st.selectbox("Choose CORA (from circles)", list(range(len(circles))), format_func=lambda i: f"Circle {i+1}")
+        cora_pt = circles[idx_cora]
 
-mask_poly = polygon_mask(img.size, poly_pts)
-mask_inv = ImageOps.invert(mask_poly)
+    # If no circle, allow manual CORA entry
+    if not cora_pt:
+        with st.expander("Set CORA manually"):
+            x = st.number_input("CORA x (px)", min_value=0.0, max_value=float(W), value=float(W/2))
+            y = st.number_input("CORA y (px)", min_value=0.0, max_value=float(H), value=float(H/2))
+            cora_pt = (x, y)
 
-proximal_piece = Image.new("RGBA", img.size, (0,0,0,0))
-distal_piece = Image.new("RGBA", img.size, (0,0,0,0))
-proximal_piece = paste_with_mask(proximal_piece, img, mask_inv)
-distal_piece = paste_with_mask(distal_piece, img, mask_poly)
+    # Osteotomy polygon
+    if polys:
+        idx_poly = st.selectbox("Choose osteotomy polygon", list(range(len(polys))), format_func=lambda i: f"Polygon {i+1}")
+        polygon_pts = polys[idx_poly]
 
-seg_mask = mask_poly if mode == "distal" else mask_inv
-arr = np.array(seg_mask) / 255.0
-ys, xs = np.nonzero(arr > 0.5)
-center = (float(xs.mean()), float(ys.mean())) if len(xs) else (W/2, H/2)
+    # When we have polygon and lines, build the transform preview
+    if polygon_pts:
+        outer, inner, mask_inv, mask_poly = split_image_by_polygon(base_img, polygon_pts)
 
-moving = distal_piece if mode == "distal" else proximal_piece
-fixed = proximal_piece if mode == "distal" else distal_piece
+        # Which segment is distal? We interpret the **inside polygon** as distal cut-piece
+        # but original behavior rotates distal segment + cut piece around hinge.
+        # We'll treat inner as cut-piece (distal). Proximal is outer.
+        distal_piece = inner
+        proximal_piece = outer
 
-moved = apply_affine(moving, dx=dx, dy=dy, rot_deg=rot, center=center)
+        # Rotation center
+        Hx, Hy = cora_pt
 
-composed = Image.new("RGBA", img.size, (0,0,0,0))
-composed = Image.alpha_composite(composed, fixed)
-composed = Image.alpha_composite(composed, moved)
+        # Rotate distal piece around CORA by theta
+        theta = math.radians(st.session_state.theta_deg)
+        # To rotate around CORA, we can shift by (0,0) and use rotate(center=(Hx,Hy))
+        moved = distal_piece.rotate(st.session_state.theta_deg, resample=Image.BICUBIC, center=(Hx, Hy), expand=False)
 
-st.image(composed, caption=f"Transformed ({mode} moved)", use_container_width=True)
+        composed = Image.new("RGBA", base_img.size, (0,0,0,0))
+        composed = Image.alpha_composite(composed, proximal_piece)
+        composed = Image.alpha_composite(composed, moved)
 
-# Export
-import pandas as pd
-params = asdict(TransformParams(mode, dx, dy, rot))
-params["polygon_points"] = poly_pts
-df = pd.DataFrame([params])
-st.download_button("Download parameters CSV", data=df.to_csv(index=False).encode("utf-8"),
-                   file_name="osteotomy_params.csv", mime="text/csv")
-buf = io.BytesIO()
-composed.save(buf, format="PNG")
-st.download_button("Download transformed image (PNG)", data=buf.getvalue(),
-                   file_name="osteotomy_transformed.png", mime="image/png")
+        # Downscale to display size
+        preview = composed.resize((canvas_w, canvas_h), Image.BICUBIC)
+        st.image(preview, caption=f"Rotated distal around CORA by {st.session_state.theta_deg}°", use_container_width=True)
+
+        # Exports
+        import pandas as pd
+        params = dict(theta_deg=st.session_state.theta_deg, cora=cora_pt, polygon_points=polygon_pts)
+        if proximal_line: params["proximal_line"] = [tuple(map(float, proximal_line.p1)), tuple(map(float, proximal_line.p2))]
+        if distal_line: params["distal_line"] = [tuple(map(float, distal_line.p1)), tuple(map(float, distal_line.p2))]
+        if px_per_mm: params["px_per_mm"] = float(px_per_mm)
+
+        df = pd.DataFrame([params])
+        st.download_button("Download parameters CSV", data=df.to_csv(index=False).encode("utf-8"),
+                           file_name="ilizarov_params.csv", mime="text/csv")
+        buf = io.BytesIO()
+        composed.save(buf, format="PNG")
+        st.download_button("Download transformed PNG", data=buf.getvalue(), file_name="ilizarov_transformed.png", mime="image/png")
+
+    else:
+        st.info("Draw and select an osteotomy polygon to preview rotation.")
+
+st.caption("Tip: Use the toolbar Line, Circle, and Polygon tools. Distal line is conceptual (yellow in original); here you select which line acts as distal.")
