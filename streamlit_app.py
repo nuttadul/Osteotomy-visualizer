@@ -7,13 +7,12 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
 import streamlit as st
-import plotly.graph_objects as go
-from streamlit_plotly_events import plotly_events
+from streamlit_image_coordinates import streamlit_image_coordinates
 import pandas as pd
 
-st.set_page_config(page_title="Bone Ninja — Locked Canvas", layout="wide")
+st.set_page_config(page_title="Bone Ninja — Simple Clicks", layout="wide")
 
-CYAN = "cyan"
+CYAN = (0, 255, 255, 255)
 
 @dataclass
 class TransformParams:
@@ -50,13 +49,12 @@ ss = st.session_state
 if "poly_points" not in ss: ss.poly_points: List[Tuple[float,float]] = []
 if "ruler_points" not in ss: ss.ruler_points: List[Tuple[float,float]] = []
 if "cora_pt" not in ss: ss.cora_pt = None
-if "last_xy" not in ss: ss.last_xy = None
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
 st.sidebar.markdown("""
-**Click on the image** to add a point to the active tool.  
-Plotly pan/zoom tools are disabled so your clicks always become points.
+Click on the image to add a point to the active tool.
+No Plotly tools. Clicks always register.
 """)
 
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
@@ -69,16 +67,16 @@ dy = st.sidebar.slider("ΔY (px)", -1000, 1000, 0, 1)
 st.sidebar.subheader("Rotation")
 rotate_deg = st.sidebar.slider("Rotate (deg)", -180, 180, 0, 1)
 
-c1, c2, c3 = st.sidebar.columns(3)
-with c1:
+b1, b2, b3 = st.sidebar.columns(3)
+with b1:
     if st.button("Undo"):
         if tool == "Polygon" and ss.poly_points: ss.poly_points.pop()
         elif tool == "Ruler" and ss.ruler_points: ss.ruler_points.pop()
         elif tool == "CORA": ss.cora_pt = None
-with c2:
+with b2:
     if st.button("Clear all"):
         ss.poly_points.clear(); ss.ruler_points.clear(); ss.cora_pt=None
-with c3:
+with b3:
     st.write("")
 
 if uploaded is None:
@@ -87,53 +85,35 @@ if uploaded is None:
 base_img = pil_from_bytes(uploaded.getvalue())
 W, H = base_img.size
 
-# ---------------- Figure ----------------
-fig = go.Figure()
-fig.update_xaxes(range=[0, W], constrain="domain", visible=False, fixedrange=True)
-fig.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False, fixedrange=True)
-fig.add_layout_image(dict(source=base_img, xref="x", yref="y", x=0, y=0, sizex=W, sizey=H, sizing="stretch", layer="below"))
-# Disable Plotly drag tools; keep click capture
-fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), dragmode=False, clickmode="event")
+# --------- Draw current overlays for preview (this is also the clickable image) ---------
+preview = base_img.copy()
+draw = ImageDraw.Draw(preview)
 
-# Invisible click-capture grid
-step = max(4, int(min(W, H) / 200))
-xs = list(range(0, W, step))
-ys = list(range(0, H, step))
-gx, gy = np.meshgrid(xs, ys)
-fig.add_trace(go.Scatter(x=gx.flatten(), y=gy.flatten(),
-                         mode="markers",
-                         marker=dict(size=10, opacity=0.001, color="rgba(0,0,0,0.001)"),
-                         hoverinfo="skip", name="click-capture"))
+# polygon
+if len(ss.poly_points) >= 1:
+    draw.line(ss.poly_points, fill=CYAN, width=2, joint="curve")
+    if len(ss.poly_points) >= 3:
+        draw.line([*ss.poly_points, ss.poly_points[0]], fill=CYAN, width=2)
 
-# Overlays
-if ss.poly_points:
-    xs2, ys2 = zip(*ss.poly_points)
-    fig.add_trace(go.Scatter(x=list(xs2)+([xs2[0]] if len(xs2)>=3 else []),
-                             y=list(ys2)+([ys2[0]] if len(ys2)>=3 else []),
-                             mode="lines+markers",
-                             line=dict(color=CYAN, width=2),
-                             marker=dict(size=6, color=CYAN),
-                             name="polygon"))
-if ss.ruler_points:
-    rx, ry = zip(*ss.ruler_points)
-    fig.add_trace(go.Scatter(x=rx, y=ry, mode="lines+markers", name="ruler"))
+# ruler
+if len(ss.ruler_points) == 1:
+    r1 = ss.ruler_points[0]
+    draw.ellipse([r1[0]-3, r1[1]-3, r1[0]+3, r1[1]+3], fill=(255,0,0,255))
+elif len(ss.ruler_points) == 2:
+    draw.line(ss.ruler_points, fill=(255,0,0,255), width=2)
+    for r in ss.ruler_points:
+        draw.ellipse([r[0]-3, r[1]-3, r[0]+3, r[1]+3], fill=(255,0,0,255))
+
+# cora
 if ss.cora_pt:
-    fig.add_trace(go.Scatter(x=[ss.cora_pt[0]], y=[ss.cora_pt[1]], mode="markers",
-                             marker=dict(size=10, symbol="circle"), name="CORA"))
+    x,y = ss.cora_pt
+    draw.ellipse([x-5,y-5,x+5,y+5], outline=(0,255,0,255), width=2)
 
-# Strict Plotly config: hide modebar, disable scroll zoom, disable logo
-config = {
-    "displayModeBar": False,
-    "scrollZoom": False,
-    "displaylogo": False,
-    "doubleClick": "reset"
-}
+st.caption("Click on the image below. Your click is immediately added to the active tool.")
+res = streamlit_image_coordinates(preview, key="imgclick", width=min(1000, W))
 
-events = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="evt_locked", config=config)
-
-if events:
-    pt = (float(events[-1]["x"]), float(events[-1]["y"]))
-    ss.last_xy = pt
+if res is not None and "x" in res and "y" in res:
+    pt = (float(res["x"]), float(res["y"]))
     if tool == "Polygon":
         ss.poly_points.append(pt)
     elif tool == "CORA":
@@ -141,10 +121,7 @@ if events:
     elif tool == "Ruler":
         if len(ss.ruler_points) >= 2: ss.ruler_points.clear()
         ss.ruler_points.append(pt)
-
-# Feedback
-if ss.last_xy:
-    st.success(f"Last point → x={ss.last_xy[0]:.1f}, y={ss.last_xy[1]:.1f} ({tool})")
+    st.success(f"Added point x={pt[0]:.1f}, y={pt[1]:.1f} to {tool}")
 
 # Measurements
 st.subheader("Measurements")
@@ -189,4 +166,4 @@ if ss.poly_points and ss.cora_pt:
     st.download_button("Download transformed image (PNG)", data=buf.getvalue(),
                        file_name="osteotomy_transformed.png", mime="image/png")
 else:
-    st.info("Click to add polygon points (≥3) and set CORA.")
+    st.info("Add polygon points (≥3) and set CORA to preview transform.")
