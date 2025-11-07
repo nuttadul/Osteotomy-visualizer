@@ -2,4 +2,3 @@ streamlit
 Pillow
 numpy
 pandas
-git+https://github.com/andfanilo/streamlit-drawable-canvas.git#egg=streamlit-drawable-canvas
