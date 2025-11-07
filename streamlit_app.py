@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from streamlit_plotly_events import plotly_events
 import pandas as pd
 
-st.set_page_config(page_title="Bone Ninja — Any‑Click Capture", layout="wide")
+st.set_page_config(page_title="Bone Ninja — Locked Canvas", layout="wide")
 
 CYAN = "cyan"
 
@@ -55,8 +55,8 @@ if "last_xy" not in ss: ss.last_xy = None
 # ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
 st.sidebar.markdown("""
-**Click anywhere on the image** to add a point to the active tool.  
-The app uses an invisible capture grid, so clicks always register.
+**Click on the image** to add a point to the active tool.  
+Plotly pan/zoom tools are disabled so your clicks always become points.
 """)
 
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
@@ -89,24 +89,21 @@ W, H = base_img.size
 
 # ---------------- Figure ----------------
 fig = go.Figure()
-fig.update_xaxes(range=[0, W], constrain="domain", visible=False)
-fig.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False)
+fig.update_xaxes(range=[0, W], constrain="domain", visible=False, fixedrange=True)
+fig.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False, fixedrange=True)
 fig.add_layout_image(dict(source=base_img, xref="x", yref="y", x=0, y=0, sizex=W, sizey=H, sizing="stretch", layer="below"))
-fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), clickmode="event+select")
+# Disable Plotly drag tools; keep click capture
+fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), dragmode=False, clickmode="event")
 
-# Invisible capture grid to receive clicks anywhere
-step = max(4, int(min(W, H) / 200))  # ~200x200 grid max
+# Invisible click-capture grid
+step = max(4, int(min(W, H) / 200))
 xs = list(range(0, W, step))
 ys = list(range(0, H, step))
-grid_x, grid_y = np.meshgrid(xs, ys)
-fig.add_trace(go.Scatter(
-    x=grid_x.flatten(),
-    y=grid_y.flatten(),
-    mode="markers",
-    marker=dict(size=8, opacity=0.001, color="rgba(0,0,0,0.001)"),
-    hoverinfo="skip",
-    name="click-capture",
-))
+gx, gy = np.meshgrid(xs, ys)
+fig.add_trace(go.Scatter(x=gx.flatten(), y=gy.flatten(),
+                         mode="markers",
+                         marker=dict(size=10, opacity=0.001, color="rgba(0,0,0,0.001)"),
+                         hoverinfo="skip", name="click-capture"))
 
 # Overlays
 if ss.poly_points:
@@ -124,13 +121,18 @@ if ss.cora_pt:
     fig.add_trace(go.Scatter(x=[ss.cora_pt[0]], y=[ss.cora_pt[1]], mode="markers",
                              marker=dict(size=10, symbol="circle"), name="CORA"))
 
-# Hide modebar
-config = {"displayModeBar": False, "scrollZoom": False}
+# Strict Plotly config: hide modebar, disable scroll zoom, disable logo
+config = {
+    "displayModeBar": False,
+    "scrollZoom": False,
+    "displaylogo": False,
+    "doubleClick": "reset"
+}
 
-# Capture clicks (nearest capture‑grid point)
-evts = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="plot_clicks_grid")
-if evts:
-    pt = (float(evts[-1]["x"]), float(evts[-1]["y"]))
+events = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="evt_locked", config=config)
+
+if events:
+    pt = (float(events[-1]["x"]), float(events[-1]["y"]))
     ss.last_xy = pt
     if tool == "Polygon":
         ss.poly_points.append(pt)
@@ -140,8 +142,6 @@ if evts:
         if len(ss.ruler_points) >= 2: ss.ruler_points.clear()
         ss.ruler_points.append(pt)
 
-st.plotly_chart(fig, use_container_width=True, config=config)
-
 # Feedback
 if ss.last_xy:
     st.success(f"Last point → x={ss.last_xy[0]:.1f}, y={ss.last_xy[1]:.1f} ({tool})")
@@ -149,8 +149,7 @@ if ss.last_xy:
 # Measurements
 st.subheader("Measurements")
 if len(ss.ruler_points) == 2:
-    px = length_of_line(*ss.ruler_points)
-    st.info(f"Ruler: {px:.2f} px")
+    st.info(f"Ruler: {length_of_line(*ss.ruler_points):.2f} px")
 else:
     st.caption("Use Ruler tool and click two points.")
 
@@ -177,18 +176,16 @@ if ss.poly_points and ss.cora_pt:
     moved = apply_affine(moving, dx=dx, dy=dy, rot_deg=rotate_deg, center=center)
 
     composed = Image.new("RGBA", base_img.size, (0,0,0,0))
-    st.image(Image.alpha_composite(Image.alpha_composite(composed, fixed), moved),
-             caption=f"Transformed ({segment_choice} moved)", use_container_width=True)
+    out_img = Image.alpha_composite(Image.alpha_composite(composed, fixed), moved)
+    st.image(out_img, caption=f"Transformed ({segment_choice} moved)", use_container_width=True)
 
     params = dict(mode=segment_choice, dx=dx, dy=dy, rotate_deg=rotate_deg,
                   polygon_points=poly_pts, cora=ss.cora_pt)
-    df_params = pd.DataFrame([params])
-    st.download_button("Download parameters CSV", data=df_params.to_csv(index=False).encode("utf-8"),
+    df = pd.DataFrame([params])
+    st.download_button("Download parameters CSV", data=df.to_csv(index=False).encode("utf-8"),
                        file_name="osteotomy_params.csv", mime="text/csv")
 
-    buf = io.BytesIO()
-    out_img = Image.alpha_composite(Image.alpha_composite(composed, fixed), moved)
-    out_img.save(buf, format="PNG")
+    buf = io.BytesIO(); out_img.save(buf, format="PNG")
     st.download_button("Download transformed image (PNG)", data=buf.getvalue(),
                        file_name="osteotomy_transformed.png", mime="image/png")
 else:
