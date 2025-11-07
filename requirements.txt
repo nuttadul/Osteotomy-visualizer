@@ -1,6 +1,5 @@
 streamlit
-plotly
-streamlit-plotly-events
 Pillow
 numpy
 pandas
+streamlit-image-coordinates
