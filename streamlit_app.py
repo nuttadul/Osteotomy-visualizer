@@ -1,154 +1,206 @@
 
-import io, sys, subprocess
-
-# ---- Self-healing install for the canvas component ----
-try:
-    from streamlit_drawable_canvas import st_canvas  # type: ignore
-except Exception:
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install",
-                               "git+https://github.com/andfanilo/streamlit-drawable-canvas.git#egg=streamlit-drawable-canvas"])
-        from streamlit_drawable_canvas import st_canvas  # retry
-    except Exception as e:
-        import streamlit as st
-        st.error("Could not install streamlit-drawable-canvas automatically. "
-                 "Please try again or use the fallback mode below.")
-        st.stop()
-
-import math
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import io
+import re
+import time
+from dataclasses import dataclass, asdict
+from typing import List, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
-import streamlit as st
 
-st.set_page_config(page_title="Ilizarov 2D — Streamlit", layout="wide")
+import streamlit as st
+import plotly.graph_objects as go
+from streamlit_plotly_events import plotly_events
+import pandas as pd
+
+st.set_page_config(page_title="Bone Ninja — Streamlit (Plotly)", layout="wide")
+
+CYAN = "cyan"
 
 @dataclass
-class Line2D:
-    p1: Tuple[float,float]
-    p2: Tuple[float,float]
+class TransformParams:
+    mode: str  # "proximal" or "distal"
+    dx: float
+    dy: float
+    rotate_deg: float
 
-def polygon_mask(size: Tuple[int,int], points: List[Tuple[float,float]]):
+def pil_from_bytes(file_bytes) -> Image.Image:
+    return Image.open(io.BytesIO(file_bytes)).convert("RGBA")
+
+def polygon_mask(size: Tuple[int,int], points: List[Tuple[float,float]]) -> Image.Image:
     mask = Image.new("L", size, 0)
     if len(points) >= 3:
         ImageDraw.Draw(mask).polygon(points, fill=255, outline=255)
     return mask
 
-def split_image_by_polygon(img: Image.Image, poly_pts: List[Tuple[float,float]]):
-    mask_poly = polygon_mask(img.size, poly_pts)
-    mask_inv = ImageOps.invert(mask_poly)
-    outer = Image.new("RGBA", img.size, (0,0,0,0))
-    inner = Image.new("RGBA", img.size, (0,0,0,0))
-    outer.paste(img, (0,0), mask_inv)
-    inner.paste(img, (0,0), mask_poly)
-    return outer, inner, mask_inv, mask_poly
+def apply_affine(img: Image.Image, dx: float, dy: float, rot_deg: float, center: Tuple[float,float]) -> Image.Image:
+    rotated = img.rotate(rot_deg, resample=Image.BICUBIC, center=center, expand=False)
+    canvas = Image.new("RGBA", img.size, (0,0,0,0))
+    canvas.alpha_composite(rotated, (int(round(dx)), int(round(dy))))
+    return canvas
 
-def center_of_mask(mask_img: Image.Image):
-    arr = np.array(mask_img, dtype=float) / 255.0
-    ys, xs = np.nonzero(arr > 0.5)
-    if len(xs) == 0: return None
-    return (float(xs.mean()), float(ys.mean()))
+def paste_with_mask(base: Image.Image, overlay: Image.Image, mask: Image.Image) -> Image.Image:
+    out = base.copy()
+    out.paste(overlay, (0,0), mask)
+    return out
 
+def angle_from_three_points(a, b, c) -> float:
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    cosang = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-12)
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def length_of_line(p1, p2) -> float:
+    return float(np.linalg.norm(np.array(p2) - np.array(p1)))
+
+# ---------------- State ----------------
+if "poly_points" not in st.session_state:
+    st.session_state.poly_points: List[Tuple[float,float]] = []
+if "ruler_points" not in st.session_state:
+    st.session_state.ruler_points: List[Tuple[float,float]] = []
+if "angle_points" not in st.session_state:
+    st.session_state.angle_points: List[Tuple[float,float]] = []
+if "px_per_mm" not in st.session_state:
+    st.session_state.px_per_mm = None
+
+# ---------------- Sidebar ----------------
 st.sidebar.title("Workflow")
-st.sidebar.markdown("""
-1. Upload image
-2. Draw **lines** (proximal/distal), a **circle** (CORA), and a **polygon** (osteotomy) on the toolbar
-3. Pick which is which in the selectors
-4. Rotate the **distal** segment around CORA
-5. Export PNG and CSV
-""")
+st.sidebar.markdown("1. Upload image\n2. Use toolbar draw tools\n3. Click **Use last closed path** to set osteotomy polygon\n4. Choose CORA (click on image)\n5. Adjust ΔX / ΔY / Rotate\n6. Export")
 
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
-canvas_w = st.sidebar.slider("Canvas width", 600, 1800, 1000, 10)
-stroke_w = st.sidebar.slider("Stroke width", 1, 6, 2)
-theta_deg = st.sidebar.slider("Rotate distal (deg)", -180, 180, 0, 1)
+segment_choice = st.sidebar.radio("Segment to move", ["distal","proximal"], horizontal=True)
 
-if not uploaded:
-    st.info("Upload an image to begin."); st.stop()
+st.sidebar.subheader("Translation")
+dx = st.sidebar.slider("ΔX (px)", -1000, 1000, 0, 1)
+dy = st.sidebar.slider("ΔY (px)", -1000, 1000, 0, 1)
+st.sidebar.subheader("Rotation")
+rotate_deg = st.sidebar.slider("Rotate (deg)", -180, 180, 0, 1)
 
-base_img = Image.open(io.BytesIO(uploaded.getvalue())).convert("RGBA")
+if uploaded is None:
+    st.info("Upload an image to begin.")
+    st.stop()
+
+base_img = pil_from_bytes(uploaded.getvalue())
 W, H = base_img.size
-scale = canvas_w / W
-canvas_h = int(H * scale)
-display_img = base_img.resize((canvas_w, canvas_h), Image.BICUBIC)
 
-# Canvas
-canvas_result = st_canvas(
-    fill_color="rgba(0,0,0,0)",
-    stroke_color="#00FFFF",
-    stroke_width=stroke_w,
-    background_image=display_img,
-    update_streamlit=True,
-    height=canvas_h,
-    width=canvas_w,
-    drawing_mode="transform",
-    display_toolbar=True,
-    key="main_canvas_autoinstall",
-)
+# ---------------- Figure ----------------
+fig = go.Figure()
+fig.update_xaxes(range=[0, W], constrain="domain", visible=False)
+fig.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False)
+fig.add_layout_image(dict(source=base_img, xref="x", yref="y", x=0, y=0, sizex=W, sizey=H, sizing="stretch", layer="below"))
+fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), dragmode="pan")
 
-objs = canvas_result.json_data["objects"] if canvas_result.json_data and "objects" in canvas_result.json_data else []
+# Modebar drawing tools
+config = {
+    "modeBarButtonsToAdd": ["drawclosedpath", "drawcircle", "drawline", "eraseshape"],
+    "displaylogo": False
+}
 
-def to_base(px, py): return (px/scale, py/scale)
+st.caption("Toolbar: draw **closed path** for osteotomy, **circle** for CORA, **line** for ruler/markers. Then use the buttons below.")
+events = plotly_events(fig, events=["relayout", "click"], click_event=True, select_event=False, override_height=None, override_width="100%", config=config, key="plot_ev")
 
-lines: List[Line2D] = []
-polys: List[List[Tuple[float,float]]] = []
-circles: List[Tuple[float,float]] = []
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    use_last_poly = st.button("Use last closed path (osteotomy)")
+with col2:
+    set_cora_from_click = st.button("Set CORA = last click")
+with col3:
+    set_ruler_from_last_line = st.button("Use last drawn line as ruler")
+with col4:
+    clear_all = st.button("Clear overlays")
 
-for ob in objs:
-    typ = ob.get("type")
-    left = float(ob.get("left", 0)); top = float(ob.get("top", 0))
-    if typ == "line":
-        x1 = left; y1 = top
-        x2 = left + float(ob.get("width", 0)); y2 = top + float(ob.get("height", 0))
-        lines.append(Line2D(to_base(x1,y1), to_base(x2,y2)))
-    elif typ == "polygon":
-        pts = []
-        for pt in ob.get("points", []):
-            x = left + float(pt.get("x", 0)); y = top + float(pt.get("y", 0))
-            pts.append(to_base(x, y))
-        if len(pts) >= 3: polys.append(pts)
-    elif typ == "circle":
-        rx = float(ob.get("rx", ob.get("radius", 0))); ry = float(ob.get("ry", ob.get("radius", 0)))
-        cx = left + rx; cy = top + ry
-        circles.append(to_base(cx, cy))
+# Parse relayout to get latest shape path
+last_path = None
+last_circle = None
+last_line = None
+if events:
+    rel = events[-1].get("relayout", {})
+    for k, v in rel.items():
+        if isinstance(v, dict) and "path" in v:  # shape dict
+            if "Z" in v["path"]:
+                last_path = v["path"]
+        elif isinstance(v, str) and ("M" in v or "L" in v) and "path" in k:
+            if "Z" in v:
+                last_path = v
+        # circle is given by 'x0','x1','y0','y1' in shape; we ignore for simplicity
 
-st.header("Select elements")
-proximal_line = distal_line = None
+# Click to set CORA
 cora_pt = None
-if lines:
-    proximal_line = lines[st.selectbox("Proximal line", list(range(len(lines))), format_func=lambda i: f"Line {i+1}")]
-if lines:
-    distal_line = lines[st.selectbox("Distal line", list(range(len(lines))), index=min(1, len(lines)-1), format_func=lambda i: f"Line {i+1}")]
-if circles:
-    cora_pt = circles[st.selectbox("CORA (circle)", list(range(len(circles))), format_func=lambda i: f"Circle {i+1}")]
-if polys:
-    polygon_pts = polys[st.selectbox("Osteotomy polygon", list(range(len(polys))), format_func=lambda i: f"Polygon {i+1}")]
-else:
-    polygon_pts = []
+if set_cora_from_click and events and "x" in events[-1] and "y" in events[-1]:
+    cora_pt = (float(events[-1]["x"]), float(events[-1]["y"]))
+elif "cora_pt" in st.session_state:
+    cora_pt = st.session_state["cora_pt"]
 
-if polygon_pts and cora_pt:
-    outer, inner, mask_inv, mask_poly = split_image_by_polygon(base_img, polygon_pts)
-    distal_piece = inner
-    proximal_piece = outer
+def path_to_points(path: str) -> List[Tuple[float,float]]:
+    pairs = re.findall(r'(-?\d+\.?\d*),(-?\d+\.?\d*)', path)
+    return [(float(x), float(y)) for x,y in pairs]
 
-    moved = distal_piece.rotate(theta_deg, resample=Image.BICUBIC, center=cora_pt, expand=False)
+if use_last_poly and last_path:
+    st.session_state.poly_points = path_to_points(last_path)
+
+if set_ruler_from_last_line and last_path:
+    pts = path_to_points(last_path)
+    if len(pts) >= 2:
+        st.session_state.ruler_points = [pts[0], pts[-1]]
+
+if clear_all:
+    st.session_state.poly_points.clear()
+    st.session_state.ruler_points.clear()
+    st.session_state.angle_points.clear()
+    st.session_state.pop("cora_pt", None)
+    cora_pt = None
+
+# Show overlays
+ov = go.Figure()
+ov.update_xaxes(range=[0, W], visible=False)
+ov.update_yaxes(range=[H, 0], scaleanchor="x", scaleratio=1, visible=False)
+ov.add_layout_image(dict(source=base_img, xref="x", yref="y", x=0, y=0, sizex=W, sizey=H, sizing="stretch", layer="below"))
+if st.session_state.poly_points:
+    xs, ys = zip(*st.session_state.poly_points)
+    ov.add_trace(go.Scatter(x=list(xs)+[xs[0]], y=list(ys)+[ys[0]], mode="lines+markers",
+                            line=dict(color=CYAN, width=2), marker=dict(size=6, color=CYAN), name="polygon"))
+if st.session_state.ruler_points:
+    xs, ys = zip(*st.session_state.ruler_points)
+    ov.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="ruler"))
+if cora_pt:
+    ov.add_trace(go.Scatter(x=[cora_pt[0]], y=[cora_pt[1]], mode="markers", marker=dict(size=10, symbol="circle"), name="CORA"))
+st.plotly_chart(ov, use_container_width=True, config={"displaylogo": False})
+
+# Preview / export
+st.header("Preview and Export")
+if st.session_state.poly_points and cora_pt:
+    poly_pts = st.session_state.poly_points
+    mask_poly = polygon_mask(base_img.size, poly_pts)
+    mask_inv = ImageOps.invert(mask_poly)
+
+    proximal_piece = Image.new("RGBA", base_img.size, (0,0,0,0))
+    distal_piece = Image.new("RGBA", base_img.size, (0,0,0,0))
+    proximal_piece = paste_with_mask(proximal_piece, base_img, mask_inv)
+    distal_piece = paste_with_mask(distal_piece, base_img, mask_poly)
+
+    seg_mask = mask_poly if segment_choice == "distal" else mask_inv
+    arr = np.array(seg_mask) / 255.0
+    ys, xs = np.nonzero(arr > 0.5)
+    center = (float(xs.mean()), float(ys.mean())) if len(xs) else (W/2, H/2)
+
+    moving = distal_piece if segment_choice == "distal" else proximal_piece
+    fixed = proximal_piece if segment_choice == "distal" else distal_piece
+
+    moved = apply_affine(moving, dx=dx, dy=dy, rot_deg=rotate_deg, center=center)
+
     composed = Image.new("RGBA", base_img.size, (0,0,0,0))
-    composed = Image.alpha_composite(composed, proximal_piece)
+    composed = Image.alpha_composite(composed, fixed)
     composed = Image.alpha_composite(composed, moved)
 
-    preview = composed.resize((canvas_w, canvas_h), Image.BICUBIC)
-    st.image(preview, caption=f"Rotated distal around CORA by {theta_deg}°", use_container_width=True)
+    st.image(composed, caption=f"Transformed ({segment_choice} moved)", use_container_width=True)
 
-    import pandas as pd, io as _io
-    params = dict(theta_deg=theta_deg, cora=cora_pt, polygon_points=polygon_pts)
-    if proximal_line: params["proximal_line"] = [proximal_line.p1, proximal_line.p2]
-    if distal_line: params["distal_line"] = [distal_line.p1, distal_line.p2]
-    df = pd.DataFrame([params])
-    st.download_button("Download parameters CSV", data=df.to_csv(index=False).encode("utf-8"),
-                       file_name="ilizarov_params.csv", mime="text/csv")
-    buf = _io.BytesIO(); composed.save(buf, format="PNG")
-    st.download_button("Download transformed PNG", data=buf.getvalue(), file_name="ilizarov_transformed.png", mime="image/png")
+    params = dict(mode=segment_choice, dx=dx, dy=dy, rotate_deg=rotate_deg, polygon_points=poly_pts, cora=cora_pt)
+    df_params = pd.DataFrame([params])
+    st.download_button("Download parameters CSV", data=df_params.to_csv(index=False).encode("utf-8"), file_name="osteotomy_params.csv", mime="text/csv")
+
+    buf = io.BytesIO()
+    composed.save(buf, format="PNG")
+    st.download_button("Download transformed image (PNG)", data=buf.getvalue(), file_name="osteotomy_transformed.png", mime="image/png")
 else:
-    st.info("Draw/select polygon and CORA to preview.")
+    st.info("Draw polygon and set CORA (click) to preview transform.")
