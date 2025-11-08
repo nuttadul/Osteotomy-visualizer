@@ -88,101 +88,137 @@ if not up:
     st.info("Upload an image to begin.")
     st.stop()
 
-# --------- image + scale ----------
-src_rgba = load_rgba(up.getvalue())
-W,H = src_rgba.size
-scale = min(ss.preview_w/float(W), 1.0)
-cw,ch = int(round(W*scale)), int(round(H*scale))
-base_rgba = src_rgba.resize((cw,ch), Image.NEAREST)
+# ---------- sizing: one scale for both canvas and preview ----------
+origW, origH = img.size
+cw = min(ss.dispw, origW)                 # canvas width
+scale = cw / float(origW)                 # single source of truth
+ch = int(round(origH * scale))            # canvas height
 
-# Fabric background image (locked object via initial_drawing)
-bg_dataurl = pil_to_dataurl(base_rgba.convert("RGB"))
+def c2o(pt):  # canvas -> original
+    return (pt[0] / scale, pt[1] / scale)
+
+def o2c(pt):  # original -> canvas
+    return (pt[0] * scale, pt[1] * scale)
+
+# resized image used BOTH by live canvas background AND the preview
+disp_img = img.resize((cw, ch), Image.NEAREST)
+
+# ---------- build initial_drawing with a locked image background ----------
+# (works across canvas versions without background_image bugs)
+import base64, io as _io
+buf = _io.BytesIO()
+disp_img.convert("RGB").save(buf, format="PNG")
+data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
 initial_drawing = {
-    "version": "5.2.4",
+    "version": "5.3.0",
     "objects": [{
         "type": "image",
+        "src": data_url,
         "left": 0, "top": 0,
         "width": cw, "height": ch,
         "scaleX": 1, "scaleY": 1,
-        "angle": 0,
-        "flipX": False, "flipY": False,
-        "opacity": 1,
-        "src": bg_dataurl,
         "selectable": False,
-        "evented": False,
-        "hasControls": False,
-        "hasBorders": False,
-        "objectCaching": False
+        "evented": False
     }]
 }
 
-# --------- UI layout ----------
-left, right = st.columns([1.1, 1])
-left.subheader("Live drawing (with real image background)")
-right.subheader("Preview (persisted shapes; click here for CORA/HINGE)")
-
-# ---------- Canvas (works even if background_image is ignored) ----------
-if ss.tool == "Polygon":
-    drawing_mode = "polyline"; stroke_color = "#00FFFF"; width_px = 2
-elif ss.tool == "Prox line":
-    drawing_mode = "line";     stroke_color = "#4285F4"; width_px = 3
-elif ss.tool == "Dist line":
-    drawing_mode = "line";     stroke_color = "#DD00DD"; width_px = 3
-else:
-    drawing_mode = "transform"   # idle
-    stroke_color = "#00FFFF"; width_px = 1
-
-with left:
-    result = st_canvas(
-        fill_color="rgba(0,0,0,0)",
-        stroke_width=width_px,
-        stroke_color=stroke_color,
-        background_color=None,                 # we use locked image object instead
-        initial_drawing=initial_drawing, 
-        update_streamlit=True,
-        width=cw, height=ch,
-        drawing_mode=drawing_mode,
-        key=f"canvas-{ss.nonce}-{ss.tool}",
-        display_toolbar=True,
-    )
-
-# Read back the canvas only for drawing tools
-if result.json_data and ss.tool in ("Polygon","Prox line","Dist line"):
-    objs = result.json_data.get("objects", [])
-    # We drew the image as the 1st object; usable shapes are later objects.
-    # Scan from the end to get the most recent line/polyline.
+# ---------- helpers to read canvas JSON ----------
+def _last_line(objs):
     for obj in reversed(objs):
-        typ = obj.get("type","")
-        if typ == "image":
-            continue
-        if ss.tool == "Polygon" and typ in ("polyline","path","polygon"):
-            pts = parse_points(obj)
-            if len(pts) >= 2:
-                p0, plast = pts[0], pts[-1]
-                if d2(plast, p0) <= (ss.snap_px*ss.snap_px) and len(pts) >= 3:
-                    closed = pts[:-1] + [p0]
-                    ss.poly = [(x/scale, y/scale) for (x,y) in closed]
-                    ss.nonce += 1
-                    st.experimental_rerun()
-            break
-        if typ == "line" and ss.tool in ("Prox line","Dist line"):
-            seg = parse_line(obj)
-            seg_full = [(x/scale, y/scale) for (x,y) in seg]
-            if ss.tool == "Prox line": ss.prox = seg_full
-            else: ss.dist = seg_full
-            break
+        if obj.get("type") == "line":
+            return [(obj["x1"], obj["y1"]), (obj["x2"], obj["y2"])]
+    return None
 
-# ---------- Preview + click-to-set CORA / HINGE ----------
-with right:
-    preview_rgba = draw_overlay(base_rgba, ss.poly, ss.prox, ss.dist, ss.cora, ss.hinge)
-    if ss.tool in ("CORA","HINGE"):
-        st.caption("Click anywhere on the image to set the point.")
-        res = streamlit_image_coordinates(preview_rgba, width=cw, key=f"clicks-{ss.nonce}")
-        if res and "x" in res and "y" in res:
-            pt = (float(res["x"])/scale, float(res["y"])/scale)
-            if ss.tool == "CORA":  ss.cora  = pt
-            if ss.tool == "HINGE": ss.hinge = pt
-            ss.nonce += 1
-            st.experimental_rerun()
-    else:
-        st.image(preview_rgba, width=cw)
+def _poly_points_from_fabric(obj):
+    """Handle both 'polyline' and 'path'."""
+    if obj.get("type") == "polyline" and "points" in obj:
+        left = obj.get("left", 0); top = obj.get("top", 0)
+        sx = obj.get("scaleX", 1.0); sy = obj.get("scaleY", 1.0)
+        pts = [(left + sx * p["x"], top + sy * p["y"]) for p in obj["points"]]
+        return pts
+    if obj.get("type") == "path" and "path" in obj:
+        pts = []
+        for cmd in obj["path"]:
+            if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] in ("M", "L"):
+                pts.append((cmd[1], cmd[2]))
+        return pts
+    return []
+
+def _last_polyline(objs):
+    for obj in reversed(objs):
+        t = obj.get("type")
+        if t in ("polyline", "path"):
+            return _poly_points_from_fabric(obj)
+    return None
+
+# setup polygon state if missing
+ss.setdefault("poly_open", True)  # True while user is still placing points
+
+# ---------- live canvas ----------
+from streamlit_drawable_canvas import st_canvas
+result = st_canvas(
+    stroke_color="#00A2FF" if ss.tool_prev in ("Prox line", "Dist line") else "#00FFFF",
+    stroke_width=3,
+    fill_color="rgba(0,0,0,0)",
+    background_color=None,
+    initial_drawing=initial_drawing,   # IMPORTANT: pass dict (not json.dumps)
+    update_streamlit=True,
+    width=cw, height=ch,
+    drawing_mode=(
+        "line" if tool in ("Prox line", "Dist line")
+        else ("polyline" if tool == "Polygon" and ss.poly_open else "transform")
+    ),
+    key=f"live-{ss.click_nonce}-{tool}",
+    display_toolbar=True,
+)
+
+# ---------- capture shapes from canvas and persist in ORIGINAL pixels ----------
+if result.json_data:
+    objs = result.json_data.get("objects", [])
+
+    # lines
+    line = _last_line(objs)
+    if line and tool in ("Prox line", "Dist line"):
+        p0, p1 = line
+        if tool == "Prox line":
+            ss.prox = [c2o(p0), c2o(p1)]
+        else:
+            ss.dist = [c2o(p0), c2o(p1)]
+
+    # polygon with snap-to-close
+    if tool == "Polygon" and ss.poly_open:
+        pts_canvas = _last_polyline(objs)
+        if pts_canvas and len(pts_canvas) >= 2:
+            # snap close when last point is near first
+            snap_px = 10   # adjust feel
+            p0 = pts_canvas[0]; pend = pts_canvas[-1]
+            if ((p0[0]-pend[0])**2 + (p0[1]-pend[1])**2) ** 0.5 <= snap_px:
+                pts_canvas[-1] = p0       # close loop exactly
+                ss.poly = [c2o(p) for p in pts_canvas]
+                ss.poly_open = False      # finished placing
+            else:
+                # live feedback but not persisted yet
+                ss.poly = [c2o(p) for p in pts_canvas]
+
+# allow “Reset poly” button to re-open placement
+if c2.button("Reset poly"):
+    ss.poly = []
+    ss.poly_open = True
+
+# ---------- right-side PREVIEW (same (cw,ch) size = same coordinates) ----------
+preview = disp_img.copy()
+draw = ImageDraw.Draw(preview)
+
+# draw persisted polygon
+if len(ss.poly) >= 3:
+    pts_c = [o2c(p) for p in ss.poly]
+    draw.polygon(pts_c, outline=(0,255,255,255), fill=(0,255,255,50), width=2)
+
+# persisted lines
+if len(ss.prox) == 2:
+    draw.line([o2c(ss.prox[0]), o2c(ss.prox[1])], fill=(66,133,244,255), width=3)
+if len(ss.dist) == 2:
+    draw.line([o2c(ss.dist[0]), o2c(ss.dist[1])], fill=(221,0,221,255), width=3)
+
+st.image(preview, caption="Preview (persisted shapes; click here for CORA/HINGE)", use_column_width=False)
