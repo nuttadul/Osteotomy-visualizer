@@ -25,12 +25,21 @@ def vec_angle(v1, v2):
     return min(deg, 180 - deg if deg > 180 else deg)
 
 def safe_canvas(bg_img, drawing_mode, stroke_color, stroke_width, key, width, height):
-    """Always show background image — compatible with all Streamlit versions."""
-    import numpy as np
-    bg_np = np.array(bg_img.convert("RGB"))  # convert PIL → NumPy array
-    
+    """
+    Universal Streamlit Drawable Canvas background handler.
+    Works for all environments — converts PIL image to base64 data URL.
+    """
+    import io, base64
+
+    # Convert PIL → base64 data URL
+    buf = io.BytesIO()
+    bg_img.convert("RGB").save(buf, format="PNG")
+    data = base64.b64encode(buf.getvalue()).decode("utf-8")
+    data_url = f"data:image/png;base64,{data}"
+
+    # Pass as data URL string to st_canvas
     return st_canvas(
-        background_image=bg_np,
+        background_image=data_url,
         fill_color="rgba(0,0,0,0)",
         background_color=None,
         stroke_color=stroke_color,
