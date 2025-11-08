@@ -60,7 +60,7 @@ def safe_width_slider(default_hint: int, uploaded_img: Optional[Image.Image]) ->
 def _vec(p0: Pt, p1: Pt) -> Pt: return (p1[0]-p0[0], p1[1]-p0[1])
 def _norm(v: Pt) -> float: return (v[0]*v[0]+v[1]*v[1])**0.5
 def _unit(v: Pt) -> Pt:
-    n=_norm(v);  return (0.0,0.0) if n==0 else (v[0]/n, v[1]/n])
+    n=_norm(v);  return (0.0,0.0) if n==0 else (v[0]/n, v[1]/n)
 def _perp(v: Pt) -> Pt: return (-v[1], v[0])
 
 def line_intersection(l1: Line, l2: Line) -> Optional[Pt]:
