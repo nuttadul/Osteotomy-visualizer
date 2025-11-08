@@ -13,18 +13,12 @@ def load_rgba(b: bytes) -> Image.Image:
     im = Image.open(io.BytesIO(b))
     return ImageOps.exif_transpose(im).convert("RGBA")
 
-def pil_to_dataurl(img: Image.Image, fmt="PNG") -> str:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/{fmt.lower()};base64,{b64}"
-
 def parse_line(obj):
     return [(float(obj.get("x1",0)), float(obj.get("y1",0))),
             (float(obj.get("x2",0)), float(obj.get("y2",0)))]
 
-def parse_points(obj):
-    # Prefer Fabric 'points'
+def parse_poly_points(obj):
+    # prefer Fabric 'points'
     if obj.get("type") in ("polyline","polygon") and isinstance(obj.get("points"), list):
         left = float(obj.get("left",0)); top = float(obj.get("top",0))
         sx = float(obj.get("scaleX",1)); sy = float(obj.get("scaleY",1))
@@ -32,7 +26,7 @@ def parse_points(obj):
         for p in obj["points"]:
             pts.append((left + sx*float(p.get("x",0)), top + sy*float(p.get("y",0))))
         return pts
-    # Fallback 'path'
+    # fallback 'path'
     if "path" in obj and isinstance(obj["path"], list):
         pts = []
         for cmd in obj["path"]:
@@ -41,7 +35,7 @@ def parse_points(obj):
         return pts
     return []
 
-def sqdist(a,b): dx=a[0]-b[0]; dy=a[1]-b[1]; return dx*dx+dy*dy
+def sqdist(a,b): dx=a[0]-b[0]; dy=a[1]-b[1]; return dx*dx + dy*dy
 
 # ---------- state ----------
 ss = st.session_state
@@ -55,11 +49,12 @@ defaults = dict(
     cora=None,
     hinge=None,
     poly_open=True,
-    nonce=0,
+    nonce=0,               # bumps canvas key to force refresh
 )
 for k,v in defaults.items():
     ss.setdefault(k, v)
 
+# ---------- sidebar ----------
 st.sidebar.header("Upload image")
 up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
 
@@ -71,14 +66,13 @@ c1,c2,c3,c4 = st.sidebar.columns(4)
 if c1.button("Reset poly"):  ss.poly.clear(); ss.poly_open=True; ss.nonce += 1
 if c2.button("Reset lines"): ss.prox.clear(); ss.dist.clear(); ss.nonce += 1
 if c3.button("Clear points"): ss.cora=None; ss.hinge=None; ss.nonce += 1
-if c4.button("Clear all"):
-    ss.poly.clear(); ss.prox.clear(); ss.dist.clear(); ss.cora=None; ss.hinge=None; ss.poly_open=True; ss.nonce += 1
+if c4.button("Resync canvas"): ss.nonce += 1  # handy if the component lags
 
 if not up:
     st.info("Upload an image to begin.")
     st.stop()
 
-# ---------- image and unified sizing ----------
+# ---------- image & unified sizing ----------
 img: Image.Image = load_rgba(up.getvalue())
 origW, origH = img.size
 cw = min(ss.preview_w, origW)          # canvas/preview width
@@ -93,33 +87,15 @@ def o2c(pt):  # original -> canvas
 
 disp_img = img.resize((cw, ch), Image.NEAREST)
 
-# Build locked image object as the first Fabric object (robust across versions)
-bg_dataurl = pil_to_dataurl(disp_img.convert("RGB"))
-initial_drawing = {
-    "version": "5.2.4",
-    "objects": [{
-        "type": "image",
-        "left": 0, "top": 0,
-        "width": cw, "height": ch,
-        "scaleX": 1, "scaleY": 1,
-        "angle": 0,
-        "src": bg_dataurl,
-        "selectable": False,
-        "evented": False,
-        "hasControls": False,
-        "hasBorders": False
-    }]
-}
-
 # ---------- layout ----------
 left, right = st.columns([1.05, 1])
 left.subheader("Live drawing (real image background)")
 right.subheader("Preview (persisted shapes). Click to set CORA / HINGE")
 
-# ---------- canvas (live) ----------
+# ---------- canvas (robust settings) ----------
 tool = ss.tool
 if tool == "Polygon":
-    drawing_mode = "polyline" if ss.poly_open else "transform"
+    drawing_mode = "polyline" if ss.poly_open else "transform"  # polyline + snap-to-close
     stroke_color = "#00FFFF"; stroke_w = 2
 elif tool == "Prox line":
     drawing_mode = "line"; stroke_color = "#4285F4"; stroke_w = 3
@@ -129,24 +105,26 @@ else:
     drawing_mode = "transform"; stroke_color = "#00FFFF"; stroke_w = 2
 
 with left:
+    # IMPORTANT: display_ratio=1.0 fixes Hi-DPI drift (mismatch) and
+    # using background_image avoids polygon component errors.
     result = st_canvas(
+        background_image=disp_img.convert("RGB"),
+        background_color="#ffffff",          # keeps component happy
+        display_ratio=1.0,                   # <<< key to matching coordinates
         fill_color="rgba(0,0,0,0)",
-        stroke_width=stroke_w,
         stroke_color=stroke_color,
-        background_color=None,              # we supply background as a locked object
-        initial_drawing=initial_drawing,    # dict, not json string
+        stroke_width=stroke_w,
+        drawing_mode=drawing_mode,
         update_streamlit=True,
         width=cw, height=ch,
-        drawing_mode=drawing_mode,
         key=f"canvas-{ss.nonce}-{tool}",
         display_toolbar=True,
     )
 
-# ---------- capture new shapes and persist in ORIGINAL coords ----------
+# ---------- capture shapes from canvas (persist in ORIGINAL coords) ----------
 if result.json_data and tool in ("Polygon","Prox line","Dist line"):
     objs = result.json_data.get("objects", [])
-
-    # get last non-image object (we locked bg as the first one)
+    # read last non-image object
     for obj in reversed(objs):
         typ = obj.get("type","")
         if typ == "image":
@@ -161,18 +139,16 @@ if result.json_data and tool in ("Polygon","Prox line","Dist line"):
             break
 
         if tool == "Polygon" and ss.poly_open and typ in ("polyline","polygon","path"):
-            pts = parse_points(obj)
+            pts = parse_poly_points(obj)
             if len(pts) >= 2:
                 p0, plast = pts[0], pts[-1]
-                # snap and close
                 if sqdist(p0, plast) <= (ss.snap_px * ss.snap_px) and len(pts) >= 3:
-                    pts[-1] = p0
+                    pts[-1] = p0                 # close loop
                     ss.poly = [c2o(p) for p in pts]
                     ss.poly_open = False
                     ss.nonce += 1
                     st.experimental_rerun()
                 else:
-                    # not closed yet; live preview of current polyline
                     ss.poly = [c2o(p) for p in pts]
             break
 
@@ -191,7 +167,7 @@ if len(ss.prox) == 2:
 if len(ss.dist) == 2:
     d.line([o2c(ss.dist[0]), o2c(ss.dist[1])], fill=(221,0,221,255), width=3)
 
-# points
+# points (set with clicks on the preview)
 if ss.cora:
     x,y = o2c(ss.cora); d.ellipse([x-5,y-5,x+5,y+5], outline=(0,200,0,255), width=2)
 if ss.hinge:
