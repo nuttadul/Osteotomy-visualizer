@@ -1,52 +1,18 @@
 
-import importlib.util
-import io
-from typing import List, Tuple, Optional
-from PIL import Image, ImageOps, ImageDraw
-import numpy as np
+import io, importlib
+from typing import List, Tuple
 import streamlit as st
+from PIL import Image, ImageDraw, ImageOps
 from streamlit_image_coordinates import streamlit_image_coordinates
+import numpy as np
 import pandas as pd
-import os
 
 st.set_page_config(page_title="Bone Ninja – Streamlit Adapter", layout="wide")
-
-def load_engine(module_path="engine.py"):
-    if not os.path.exists(module_path):
-        return None
-    spec = importlib.util.spec_from_file_location("engine", module_path)
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)  # type: ignore
-        if hasattr(mod, "apply_transform"):
-            return mod
-    except Exception as e:
-        st.warning(f"Couldn't import engine.py: {e}")
-    return None
-
-ENGINE = load_engine()
 
 def decode_image(file_bytes):
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img).convert("RGBA")
     return img
-
-def polygon_mask(size, points):
-    mask = Image.new("L", size, 0)
-    if len(points) >= 3:
-        ImageDraw.Draw(mask).polygon(points, fill=255, outline=255)
-    return mask
-
-def apply_affine(img, dx, dy, rot_deg, center):
-    rotated = img.rotate(rot_deg, resample=Image.BICUBIC, center=center, expand=False)
-    canvas = Image.new("RGBA", img.size, (0,0,0,0))
-    canvas.alpha_composite(rotated, (int(round(dx)), int(round(dy))))
-    return canvas
-
-def paste_with_mask(base, overlay, mask):
-    out = base.copy()
-    out.paste(overlay, (0,0), mask)
-    return out
 
 def centroid_of_polygon(pts):
     if len(pts) < 3: return None
@@ -63,59 +29,42 @@ def centroid_of_polygon(pts):
     cx /= (6*a); cy /= (6*a)
     return (cx, cy)
 
-def rotate_point(p, center, angle_deg):
-    ang = np.deg2rad(angle_deg)
-    c, s = np.cos(ang), np.sin(ang)
-    x, y = p; cx, cy = center
-    x0, y0 = x - cx, y - cy
-    xr = x0*c - y0*s + cx
-    yr = x0*s + y0*c + cy
-    return (float(xr), float(yr))
-
-def transform_points(points, dx, dy, angle_deg, center):
-    out = []
-    for (px,py) in points:
-        xr, yr = rotate_point((px,py), center, angle_deg)
-        out.append((xr + dx, yr + dy))
-    return out
+# Import the engine module (this file is created in the bundle)
+engine = importlib.import_module("simplify_bone_ninja")
 
 ss = st.session_state
 for k, v in dict(poly=[], cora=None, hinge=None, prox=[], dist=[], ruler=[], dispw=1100).items():
     ss.setdefault(k, v)
 
-st.sidebar.title("Streamlit Adapter")
+st.sidebar.header("Controls")
 uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
-tool = st.sidebar.radio("Tool", ["Polygon","CORA","HINGE","Proximal line","Distal line","Ruler"])
-seg = st.sidebar.radio("Segment to move", ["distal","proximal"], horizontal=True)
-center_mode = st.sidebar.radio("Center", ["HINGE","CORA","Polygon centroid"], index=0)
+tool = st.sidebar.radio("Tool", ["Polygon","CORA","HINGE","Prox line","Dist line","Ruler"], horizontal=False)
+segment = st.sidebar.radio("Move segment", ["distal","proximal"], horizontal=True)
+center_mode = st.sidebar.radio("Rotation center", ["HINGE","CORA","Polygon centroid"], index=0)
 ss.dispw = st.sidebar.slider("Preview width", 600, 1800, ss.dispw, 50)
-dx = st.sidebar.slider("ΔX", -1000, 1000, 0, 1)
-dy = st.sidebar.slider("ΔY", -1000, 1000, 0, 1)
+dx = st.sidebar.slider("ΔX (px)", -1000, 1000, 0, 1)
+dy = st.sidebar.slider("ΔY (px)", -1000, 1000, 0, 1)
 theta = st.sidebar.slider("Rotate (deg)", -180, 180, 0, 1)
 
-cols = st.sidebar.columns(5)
-if cols[0].button("Undo"):
+c1, c2, c3, c4, c5 = st.sidebar.columns(5)
+if c1.button("Undo"):
     if tool == "Polygon" and ss.poly: ss.poly.pop()
-    elif tool == "Proximal line" and ss.prox: ss.prox.pop()
-    elif tool == "Distal line" and ss.dist: ss.dist.pop()
+    elif tool == "Prox line" and ss.prox: ss.prox.pop()
+    elif tool == "Dist line" and ss.dist: ss.dist.pop()
     elif tool == "Ruler" and ss.ruler: ss.ruler.pop()
-    elif tool == "CORA": ss.cora=None
-    elif tool == "HINGE": ss.hinge=None
-if cols[1].button("Reset polygon"): ss.poly.clear()
-if cols[2].button("Reset lines"): ss.prox.clear(); ss.dist.clear()
-if cols[3].button("Clear centers"): ss.cora=None; ss.hinge=None
-if cols[4].button("Clear ruler"): ss.ruler.clear()
+    elif tool == "CORA": ss.cora = None
+    elif tool == "HINGE": ss.hinge = None
+if c2.button("Reset polygon"): ss.poly.clear()
+if c3.button("Reset lines"): ss.prox.clear(); ss.dist.clear()
+if c4.button("Clear centers"): ss.cora=None; ss.hinge=None
+if c5.button("Clear ruler"): ss.ruler.clear()
 
 if uploaded is None:
     st.info("Upload an image to begin.")
     st.stop()
 
-@st.cache_data(show_spinner=False)
-def load_img(data: bytes):
-    img = decode_image(data)
-    return img, img.size
-
-img, (W,H) = load_img(uploaded.getvalue())
+img = decode_image(uploaded.getvalue())
+W, H = img.size
 disp_w = min(ss.dispw, W)
 scale = disp_w / float(W)
 disp_h = int(round(H*scale))
@@ -143,51 +92,43 @@ if ss.hinge:
     d.line([(x,y-12),(x,y+12)], fill=(255,165,0,255), width=1)
 
 disp_img = preview.resize((disp_w, disp_h), Image.NEAREST)
-res = streamlit_image_coordinates(disp_img, key="click", width=disp_w, css={"cursor":"crosshair"})
-
-def to_orig(pt): return (float(pt[0])/scale, float(pt[1])/scale)
+res = streamlit_image_coordinates(disp_img, key="clicks", width=disp_w, css={"cursor":"crosshair"})
+def to_orig(pt_disp): return (float(pt_disp[0])/scale, float(pt_disp[1])/scale)
 
 if res and "x" in res and "y" in res:
     pt = to_orig((res["x"], res["y"]))
-    if tool=="Polygon": ss.poly.append(pt)
-    elif tool=="CORA": ss.cora=pt
-    elif tool=="HINGE": ss.hinge=pt
-    elif tool=="Proximal line":
-        if len(ss.prox)>=2: ss.prox.clear()
+    if tool == "Polygon": ss.poly.append(pt)
+    elif tool == "CORA": ss.cora = pt
+    elif tool == "HINGE": ss.hinge = pt
+    elif tool == "Prox line":
+        if len(ss.prox) >= 2: ss.prox.clear()
         ss.prox.append(pt)
-    elif tool=="Distal line":
-        if len(ss.dist)>=2: ss.dist.clear()
+    elif tool == "Dist line":
+        if len(ss.dist) >= 2: ss.dist.clear()
         ss.dist.append(pt)
-    elif tool=="Ruler":
-        if len(ss.ruler)>=2: ss.ruler.clear()
+    elif tool == "Ruler":
+        if len(ss.ruler) >= 2: ss.ruler.clear()
         ss.ruler.append(pt)
-    st.success(f"{tool} point: ({pt[0]:.1f},{pt[1]:.1f})")
+    st.success(f"Added {tool} point: ({pt[0]:.1f},{pt[1]:.1f})")
 
+# Determine rotation center
 center = None
-if center_mode=="HINGE" and ss.hinge: center=ss.hinge
-elif center_mode=="CORA" and ss.cora: center=ss.cora
+if center_mode == "HINGE" and ss.hinge: center = ss.hinge
+elif center_mode == "CORA" and ss.cora: center = ss.cora
 else: center = centroid_of_polygon(ss.poly) or ss.cora or ss.hinge
 
 st.header("Preview & Export")
-if len(ss.poly)>=3 and center is not None:
-    if ENGINE and hasattr(ENGINE, "apply_transform"):
-        out_img = ENGINE.apply_transform(img, ss.poly, center, dx, dy, theta, seg)
-    else:
-        mask_poly = polygon_mask(img.size, ss.poly)
-        mask_inv = ImageOps.invert(mask_poly)
-        prox = Image.new("RGBA", img.size, (0,0,0,0))
-        dist = Image.new("RGBA", img.size, (0,0,0,0))
-        prox = paste_with_mask(prox, img, mask_inv)
-        dist = paste_with_mask(dist, img, mask_poly)
-        moving = dist if seg=="distal" else prox
-        fixed = prox if seg=="distal" else dist
-        moved = apply_affine(moving, dx=dx, dy=dy, rot_deg=theta, center=center)
-        canvas = Image.new("RGBA", img.size, (0,0,0,0))
-        out_img = Image.alpha_composite(Image.alpha_composite(canvas, fixed), moved)
-
+if len(ss.poly) >= 3 and center is not None:
+    out_img = engine.apply_transform(
+        img_rgba=img,
+        polygon_pts=ss.poly,
+        center_xy=center,
+        dx=dx, dy=dy, theta_deg=theta,
+        segment=segment,
+    )
     st.image(out_img.resize((disp_w, disp_h), Image.NEAREST), use_container_width=True)
 
-    params = dict(mode=seg, dx=dx, dy=dy, rotate_deg=theta,
+    params = dict(mode=segment, dx=dx, dy=dy, rotate_deg=theta,
                   rotation_center=center, polygon_points=ss.poly,
                   cora=ss.cora, hinge=ss.hinge,
                   proximal_line=ss.prox, distal_line=ss.dist)
