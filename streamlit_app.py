@@ -1,278 +1,309 @@
+# streamlit_app.py
 import io, math
-from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
-
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-# ----------------------------- Utilities -----------------------------
-Pt = Tuple[float, float]
-Line = Tuple[Pt, Pt]
+st.set_page_config(page_title="Osteotomy – snappy click tools (single image)", layout="wide")
 
-def to_int(p: Pt) -> Tuple[int, int]:
-    return (int(round(p[0])), int(round(p[1])))
+# ------------------------------- helpers -------------------------------
 
-def distance(a: Pt, b: Pt) -> float:
-    return math.hypot(a[0]-b[0], a[1]-b[1])
+def load_rgba(b: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(b))
+    return ImageOps.exif_transpose(img).convert("RGBA")
 
-def line_angle(line: Line) -> float:
-    (x1,y1),(x2,y2) = line
-    return math.degrees(math.atan2(y2-y1, x2-x1))
+def angle_deg(p0: Tuple[float,float], p1: Tuple[float,float]) -> float:
+    """Return absolute angle (deg) from p0->p1 (screen coords, y-down)."""
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    # y-down screen: atan2(-dy, dx) gives conventional mathematical angle
+    a = math.degrees(math.atan2(-(dy), dx))
+    if a < 0: a += 360.0
+    return a
 
-def rotate_point(p: Pt, center: Pt, deg: float) -> Pt:
-    ang = math.radians(deg)
-    c, s = math.cos(ang), math.sin(ang)
-    x, y = p[0]-center[0], p[1]-center[1]
-    return (center[0] + x*c - y*s, center[1] + x*s + y*c)
-
-def translate(p: Pt, dx: float, dy: float) -> Pt:
-    return (p[0]+dx, p[1]+dy)
-
-def apply_affine_to_line(line: Line, center: Pt, dx: float, dy: float, deg: float) -> Line:
-    return (
-        translate(rotate_point(line[0], center, deg), dx, dy),
-        translate(rotate_point(line[1], center, deg), dx, dy),
-    )
-
-def polygon_mask(size: Tuple[int,int], pts: List[Pt]) -> Image.Image:
+def polygon_mask(size: Tuple[int,int], pts: List[Tuple[float,float]]) -> Image.Image:
     m = Image.new("L", size, 0)
     if len(pts) >= 3:
         ImageDraw.Draw(m).polygon(pts, fill=255, outline=255)
     return m
 
-def split_by_polygon(img_rgba: Image.Image, poly: List[Pt]) -> Tuple[Image.Image, Image.Image]:
-    """Return (prox_segment, dist_segment) by polygon selection.
-       By convention the polygon area is the 'distal' piece."""
-    size = img_rgba.size
-    mask = polygon_mask(size, poly)
-    inv  = ImageOps.invert(mask)
-    prox = Image.new("RGBA", size, (0,0,0,0)); prox.paste(img_rgba, (0,0), inv)
-    dist = Image.new("RGBA", size, (0,0,0,0)); dist.paste(img_rgba, (0,0), mask)
-    return prox, dist
+def centroid(pts: List[Tuple[float,float]]) -> Optional[Tuple[float,float]]:
+    if len(pts) < 3: return None
+    x = [p[0] for p in pts]; y = [p[1] for p in pts]
+    a = 0.0; cx = 0.0; cy = 0.0
+    for i in range(len(pts)):
+        j = (i+1) % len(pts)
+        cross = x[i]*y[j] - x[j]*y[i]
+        a += cross
+        cx += (x[i] + x[j]) * cross
+        cy += (y[i] + y[j]) * cross
+    a *= 0.5
+    if abs(a) < 1e-9: return None
+    cx /= (6*a); cy /= (6*a)
+    return (cx, cy)
 
-# ----------------------------- State -----------------------------
-@dataclass
-class Axes:
-    joint_tangent: Optional[Line] = None
-    axis_line: Optional[Line] = None
+def apply_affine_fragment(moving: Image.Image,
+                          dx: float, dy: float,
+                          rot_deg: float, center_xy: Tuple[float,float]) -> Image.Image:
+    """
+    Rotate around center (screen y-down), then translate by dx,dy.
+    Pillow rotate is CCW in y-down, which is what we want for on-screen.
+    """
+    rot = moving.rotate(rot_deg, resample=Image.BICUBIC, center=center_xy, expand=False)
+    out = Image.new("RGBA", moving.size, (0,0,0,0))
+    # translation is simply an offset for compositing
+    out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
+    return out
 
-@dataclass
-class AppState:
-    poly: List[Pt] = field(default_factory=list)
-    poly_closed: bool = False
-    hinge: Optional[Pt] = None
+def transform_points_y_down(points: List[Tuple[float,float]],
+                            dx: float, dy: float,
+                            rot_deg: float, center: Tuple[float,float]) -> List[Tuple[float,float]]:
+    """Same rotation/translation used for the image fragment."""
+    if not points: return []
+    ang = math.radians(rot_deg)
+    c, s = math.cos(ang), math.sin(ang)
+    cx, cy = center
+    out = []
+    for (x, y) in points:
+        x0, y0 = x - cx, y - cy
+        xr =  x0*c + y0*s + cx + dx
+        yr = -x0*s + y0*c + cy + dy
+        out.append((xr, yr))
+    return out
 
-    prox_axes: Axes = field(default_factory=Axes)
-    dist_axes: Axes = field(default_factory=Axes)
+def draw_overlay(base: Image.Image, ss) -> Image.Image:
+    """Return a copy of base + all shapes drawn."""
+    show = base.copy()
+    d = ImageDraw.Draw(show, "RGBA")
 
-    move_segment: str = "distal"   # "distal" or "proximal"
-    dx: float = 0.0
-    dy: float = 0.0
-    theta: float = 0.0             # degrees (CCW)
+    # Polygon (nodes & edges)
+    if ss.poly:
+        # edges
+        if len(ss.poly) >= 2:
+            d.line(ss.poly, fill=(0,255,255,255), width=2)
+        # closing edge preview if closed
+        if ss.poly_closed and len(ss.poly) >= 3:
+            d.line([ss.poly[-1], ss.poly[0]], fill=(0,255,255,255), width=2)
+        # nodes
+        for p in ss.poly:
+            d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=(0,255,255,200))
 
-    disp_w: int = 1100             # display width (pixels)
+    # Axes & joints
+    def _draw_line(line, color):
+        if len(line) == 2:
+            d.line(line, fill=color, width=3)
+            # endpoints
+            for p in line:
+                d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=color)
 
-def S() -> AppState:
-    if "APPSTATE" not in st.session_state:
-        st.session_state.APPSTATE = AppState()
-    return st.session_state.APPSTATE  # type: ignore
+    _draw_line(ss.prox_axis, (66,133,244,255))
+    _draw_line(ss.dist_axis, (221,0,221,255))
+    _draw_line(ss.prox_joint, (255,215,0,220))
+    _draw_line(ss.dist_joint, (255,215,0,220))
 
-# ----------------------------- Drawer -----------------------------
-def draw_overlay(base_rgb: Image.Image, state: AppState) -> Image.Image:
-    out = base_rgb.convert("RGBA")
-    W,H = out.size
-    draw0 = ImageDraw.Draw(out, "RGBA")
+    # Points
+    if ss.cora:
+        x,y=ss.cora; d.ellipse([x-6,y-6,x+6,y+6], outline=(0,200,0,255), width=2)
+    if ss.hinge:
+        x,y=ss.hinge
+        d.ellipse([x-7,y-7,x+7,y+7], outline=(255,165,0,255), width=3)
+        d.line([(x-12,y),(x+12,y)], fill=(255,165,0,255), width=1)
+        d.line([(x,y-12),(x,y+12)], fill=(255,165,0,255), width=1)
 
-    # Polygon nodes/outline
-    if state.poly:
-        for p in state.poly:
-            r = 4; x,y = p
-            draw0.ellipse([x-r,y-r,x+r,y+r], fill=(0,255,255,220))
-        if len(state.poly) >= 2:
-            draw0.line(state.poly, fill=(0,255,255,180), width=2)
-            if state.poly_closed and len(state.poly) >= 3:
-                draw0.line([state.poly[-1], state.poly[0]], fill=(0,255,255,180), width=2)
+    # Report angles
+    def _label_angle(line, label_y):
+        if len(line) == 2:
+            a = angle_deg(line[0], line[1])
+            d.rectangle([6,label_y-12,220,label_y+6], fill=(0,0,0,160))
+            d.text((10,label_y-10), f"angle {a:.1f}°", fill=(255,255,255,230))
 
-    # Compose moved segment if polygon & hinge present
-    composed = Image.new("RGBA", (W,H), (0,0,0,0))
-    base_rgba = base_rgb.convert("RGBA")
-    if state.poly_closed and state.hinge is not None and len(state.poly) >= 3:
-        prox, dist = split_by_polygon(base_rgba, state.poly)
-        moving  = dist if state.move_segment == "distal" else prox
-        fixed   = prox if state.move_segment == "distal" else dist
+    ytick=8
+    if len(ss.prox_joint)==2: _label_angle(ss.prox_joint, ytick); ytick+=18
+    if len(ss.dist_joint)==2: _label_angle(ss.dist_joint, ytick); ytick+=18
+    if len(ss.prox_axis)==2:  _label_angle(ss.prox_axis,  ytick); ytick+=18
+    if len(ss.dist_axis)==2:  _label_angle(ss.dist_axis,  ytick); ytick+=18
 
-        moved = Image.new("RGBA", (W,H), (0,0,0,0))
-        rot   = moving.rotate(state.theta, resample=Image.BICUBIC, center=state.hinge, expand=False)
-        moved.alpha_composite(rot, (int(round(state.dx)), int(round(state.dy))))
+    return show
 
-        composed.alpha_composite(fixed)
-        composed.alpha_composite(moved)
-    else:
-        composed.alpha_composite(base_rgba)
+# --------------------------- session state -----------------------------
 
-    draw = ImageDraw.Draw(composed, "RGBA")
-    green = (90, 200, 90, 255)
-    blue  = (70, 140, 255, 255)
-    mag   = (200, 70, 200, 255)
-    orange= (255, 170, 0, 255)
+ss = st.session_state
+defaults = dict(
+    # basic
+    dispw=1100,
+    tool="Polygon",
+    last_click=None,   # debouncer
+    # geometry
+    poly=[],
+    poly_closed=False,
+    hinge=None,
+    cora=None,
+    prox_axis=[],
+    dist_axis=[],
+    prox_joint=[],
+    dist_joint=[],
+    # sim
+    move_segment="distal",   # "distal" or "proximal"
+    dx=0, dy=0, theta=0,     # motion controls
+)
+for k,v in defaults.items(): ss.setdefault(k,v)
 
-    def put_line(line: Optional[Line], col):
-        if not line: return
-        draw.line([to_int(line[0]), to_int(line[1])], fill=col, width=3)
+# ------------------------------ sidebar --------------------------------
 
-    # Transform the axes that belong to the moving part
-    if state.move_segment == "distal":
-        if state.dist_axes.joint_tangent:
-            jt = apply_affine_to_line(state.dist_axes.joint_tangent, state.hinge or (0,0), state.dx,state.dy,state.theta)
-            put_line(jt, orange)
-        if state.dist_axes.axis_line:
-            ax = apply_affine_to_line(state.dist_axes.axis_line, state.hinge or (0,0), state.dx,state.dy,state.theta)
-            put_line(ax, mag)
-        put_line(state.prox_axes.joint_tangent, orange)
-        put_line(state.prox_axes.axis_line, blue)
-    else:
-        if state.prox_axes.joint_tangent:
-            jt = apply_affine_to_line(state.prox_axes.joint_tangent, state.hinge or (0,0), state.dx,state.dy,state.theta)
-            put_line(jt, orange)
-        if state.prox_axes.axis_line:
-            ax = apply_affine_to_line(state.prox_axes.axis_line, state.hinge or (0,0), state.dx,state.dy,state.theta)
-            put_line(ax, blue)
-        put_line(state.dist_axes.joint_tangent, orange)
-        put_line(state.dist_axes.axis_line, mag)
+st.sidebar.header("Load image")
+up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
+ss.tool = st.sidebar.radio("Tool", ["Polygon", "Prox axis", "Dist axis",
+                                    "Prox joint", "Dist joint", "HINGE", "CORA"],
+                           index=["Polygon","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"].index(ss.tool))
 
-    if state.hinge:
-        x,y = state.hinge
-        draw.ellipse([x-6,y-6,x+6,y+6], outline=(255,165,0,255), width=3)
-        draw.line([(x-12,y),(x+12,y)], fill=(255,165,0,200), width=1)
-        draw.line([(x,y-12),(x,y+12)], fill=(255,165,0,200), width=1)
+# snappy UX helpers
+c1,c2,c3,c4 = st.sidebar.columns(4)
+if c1.button("Reset poly"):    ss.poly=[]; ss.poly_closed=False
+if c2.button("Reset axes"):    ss.prox_axis=[]; ss.dist_axis=[]
+if c3.button("Reset joints"):  ss.prox_joint=[]; ss.dist_joint=[]
+if c4.button("Clear points"):  ss.hinge=None; ss.cora=None
 
-    # Simple angle labels
-    def put_angle(label: str, line: Optional[Line], xy: Optional[Pt]=None, col=(255,255,255,230)):
-        if not line: return
-        ang = line_angle(line)
-        p = xy or line[1]
-        draw.rectangle([p[0]+6, p[1]-18, p[0]+120, p[1]+4], fill=(0,0,0,140))
-        draw.text((p[0]+8, p[1]-16), f"{label}: {ang:.1f}°", fill=col)
+ss.move_segment = st.sidebar.radio("Move which part after osteotomy?",
+                                   ["distal","proximal"], horizontal=True,
+                                   index=0 if ss.move_segment=="distal" else 1)
 
-    if state.prox_axes.joint_tangent: put_angle("prox joint", state.prox_axes.joint_tangent)
-    if state.prox_axes.axis_line:     put_angle("prox axis",  state.prox_axes.axis_line, col=blue)
-    if state.dist_axes.joint_tangent: put_angle("dist joint", state.dist_axes.joint_tangent)
-    if state.dist_axes.axis_line:     put_angle("dist axis",  state.dist_axes.axis_line, col=mag)
+ss.dispw = st.sidebar.slider("Preview width", 600, 1800, ss.dispw, 50)
 
-    return composed.convert("RGB")
+st.sidebar.markdown("---")
+ss.dx    = st.sidebar.slider("ΔX (px)", -1000, 1000, ss.dx, 1)
+ss.dy    = st.sidebar.slider("ΔY (px)", -1000, 1000, ss.dy, 1)
+ss.theta = st.sidebar.slider("Rotate (°)", -180, 180, ss.theta, 1)
 
-# ----------------------------- Tools -----------------------------
-TOOLS = [
-    "Polygon",
-    "Hinge",
-    "Prox joint line",
-    "Prox axis",
-    "Dist joint line",
-    "Dist axis",
-]
+# ------------------------------ main -----------------------------------
 
-def add_point_to_polygon(state: AppState, click: Pt, close_eps: float=10.0):
-    if not state.poly_closed:
-        state.poly.append(click)
-        if len(state.poly) >= 3 and distance(click, state.poly[0]) <= close_eps:
-            state.poly[-1] = state.poly[0]
-            state.poly_closed = True
-
-def add_line_endpoint(current: Optional[Line], click: Pt) -> Optional[Line]:
-    if current is None:
-        return (click, click)
-    p0, p1 = current
-    if p0 == p1:
-        return (p0, click)
-    return (click, click)
-
-# ----------------------------- App -----------------------------
-st.set_page_config(page_title="Osteotomy Visualizer (single-image, snappy)", layout="wide")
-st.title("Osteotomy Visualizer (single image, snappy click)")
-
-state = S()
-
-# Sidebar: load
-st.sidebar.subheader("1) Load image")
-up = st.sidebar.file_uploader("X-ray image", type=["png","jpg","jpeg","tif","tiff"])
 if not up:
     st.info("Upload an image to begin.")
     st.stop()
 
-img_rgba = Image.open(io.BytesIO(up.getvalue()))
-img_rgba = ImageOps.exif_transpose(img_rgba).convert("RGBA")
-W,H = img_rgba.size
+img = load_rgba(up.getvalue())
+W,H = img.size
+scale = min(ss.dispw/float(W), 1.0)
+disp = img.resize((int(round(W*scale)), int(round(H*scale))), Image.NEAREST)
 
-# ---- SAFE slider bounds (fix for your error)
-max_w = max(1, min(W, 1800))                 # upper bound cannot be < 1
-min_w = max(200, min(600, max_w))            # lower bound <= upper, at least 200
-default_w = max(min_w, min(1100, max_w))     # inside [min_w, max_w]
-step = max(1, min(50, max_w - min_w))        # at least 1, not larger than range
-state.disp_w = st.sidebar.slider("Display width", min_w, max_w, default_w, step)
+# ---------- apply osteotomy transform (if polygon closed) ----------
+composite_for_display = disp.copy()
 
-scale   = state.disp_w / float(W)
-disp_h  = int(round(H * scale))
-base_rgb = img_rgba.resize((state.disp_w, disp_h), Image.NEAREST).convert("RGB")
+if ss.poly_closed and len(ss.poly) >= 3:
+    # NOTE: polygon is in display (scaled) coordinates.
+    poly_disp = ss.poly
+    m_disp = polygon_mask(disp.size, poly_disp)
+    inv_disp = ImageOps.invert(m_disp)
 
-# Tools
-st.sidebar.subheader("2) Draw tools")
-tool = st.sidebar.radio("Active tool", TOOLS, index=0)
+    prox_disp = Image.new("RGBA", disp.size, (0,0,0,0)); prox_disp.paste(disp, (0,0), inv_disp)
+    dist_disp = Image.new("RGBA", disp.size, (0,0,0,0)); dist_disp.paste(disp, (0,0), m_disp)
 
-# Movement
-st.sidebar.subheader("3) Segment transform")
-state.move_segment = st.sidebar.radio("Which part moves?", ["distal","proximal"], index=0, horizontal=True)
-state.dx    = st.sidebar.slider("ΔX (px)", -1000, 1000, int(state.dx), 1)
-state.dy    = st.sidebar.slider("ΔY (px)", -1000, 1000, int(state.dy), 1)
-state.theta = st.sidebar.slider("Rotate (°)", -180, 180, int(state.theta), 1)
+    # Pick moving/fixed in display space
+    moving = dist_disp if ss.move_segment=="distal" else prox_disp
+    fixed  = prox_disp if ss.move_segment=="distal" else dist_disp
 
-# Reset
-cA,cB,cC,cD = st.sidebar.columns(4)
-if cA.button("Undo poly"):
-    if state.poly: state.poly.pop()
-    if len(state.poly) < 3: state.poly_closed = False
-if cB.button("Clear poly"):
-    state.poly.clear(); state.poly_closed=False
-if cC.button("Clear lines"):
-    state.prox_axes = Axes(); state.dist_axes = Axes()
-if cD.button("Clear hinge"):
-    state.hinge = None
+    # center to rotate about: prefer hinge, else centroid
+    center = ss.hinge or centroid(poly_disp) or (disp.size[0]/2.0, disp.size[1]/2.0)
 
-# Working image
-composite = draw_overlay(base_rgb, state)
-st.subheader("Working image (click to add / set with current tool)")
-click = streamlit_image_coordinates(composite, width=composite.width, key="click-main")
+    moved = apply_affine_fragment(moving, ss.dx, ss.dy, ss.theta, center)
 
-# Immediate handling
+    # Composite
+    base = Image.new("RGBA", disp.size, (0,0,0,0))
+    base.alpha_composite(fixed)
+    base.alpha_composite(moved)
+    composite_for_display = base
+
+# Draw overlays (lines/points) onto the current (possibly transformed) composite
+overlay = draw_overlay(composite_for_display, ss)
+
+# ---------- single image + immediate click handling ----------
+# Show only once (this widget also captures clicks)
+click = streamlit_image_coordinates(overlay.convert("RGB"), width=overlay.width, key="click-main")
+
+# Debounce: recognise a *new* click only once
 if click and "x" in click and "y" in click:
-    p = (float(click["x"]), float(click["y"]))
-    if tool == "Polygon":
-        add_point_to_polygon(state, p)
-    elif tool == "Hinge":
-        state.hinge = p
-    elif tool == "Prox joint line":
-        state.prox_axes.joint_tangent = add_line_endpoint(state.prox_axes.joint_tangent, p)
-    elif tool == "Prox axis":
-        state.prox_axes.axis_line = add_line_endpoint(state.prox_axes.axis_line, p)
-    elif tool == "Dist joint line":
-        state.dist_axes.joint_tangent = add_line_endpoint(state.dist_axes.joint_tangent, p)
-    elif tool == "Dist axis":
-        state.dist_axes.axis_line = add_line_endpoint(state.dist_axes.axis_line, p)
+    event = (click["x"], click["y"], overlay.width, overlay.height, ss.tool)
+    if event != ss.last_click:
+        ss.last_click = event
+        px, py = float(click["x"]), float(click["y"])
 
-st.caption(
-    """
-**Tips**
-- Choose a tool, then click the image. Nodes/lines appear **immediately** (no second click).
-- **Polygon** closes when your last click is close to the first vertex.
-- **Hinge** sets the rotation center.
-- Draw **joint lines** and **axes** with two clicks; a third click starts a new line.
-- The axis of the **moving** segment translates & rotates with the osteotomy.
-"""
-)
+        # Map click into current display coords directly (overlay is display-sized)
+        p = (px, py)
 
-# Download current view
-buf = io.BytesIO()
-draw_overlay(base_rgb, state).save(buf, format="PNG")
-st.download_button("Download current view (PNG)", data=buf.getvalue(),
-                   file_name="osteotomy_view.png", mime="image/png")
+        # Tool behaviours (SNAPPY: immediate update)
+        if ss.tool == "Polygon":
+            if not ss.poly_closed:
+                # close if near first
+                if len(ss.poly) >= 3:
+                    x0,y0 = ss.poly[0]
+                    if (px-x0)**2 + (py-y0)**2 <= 10**2:
+                        # snap close
+                        ss.poly_closed = True
+                    else:
+                        ss.poly.append(p)
+                else:
+                    ss.poly.append(p)
+
+        elif ss.tool == "Prox axis":
+            if len(ss.prox_axis) < 1:
+                ss.prox_axis = [p]
+            elif len(ss.prox_axis) == 1:
+                ss.prox_axis.append(p)
+            else:
+                # restart quickly
+                ss.prox_axis = [p]
+
+        elif ss.tool == "Dist axis":
+            if len(ss.dist_axis) < 1:
+                ss.dist_axis = [p]
+            elif len(ss.dist_axis) == 1:
+                ss.dist_axis.append(p)
+            else:
+                ss.dist_axis = [p]
+
+        elif ss.tool == "Prox joint":
+            if len(ss.prox_joint) < 1:
+                ss.prox_joint = [p]
+            elif len(ss.prox_joint) == 1:
+                ss.prox_joint.append(p)
+            else:
+                ss.prox_joint = [p]
+
+        elif ss.tool == "Dist joint":
+            if len(ss.dist_joint) < 1:
+                ss.dist_joint = [p]
+            elif len(ss.dist_joint) == 1:
+                ss.dist_joint.append(p)
+            else:
+                ss.dist_joint = [p]
+
+        elif ss.tool == "HINGE":
+            ss.hinge = p
+
+        elif ss.tool == "CORA":
+            ss.cora = p
+
+        # After any click that changes geometry, re-run immediately (snappy)
+        st.experimental_rerun()
+
+# ------------- update axes positions when fragment moves -------------
+# If polygon is closed & fragment moved, transform the axis that belongs to it
+if ss.poly_closed and len(ss.poly) >= 3:
+    center = ss.hinge or centroid(ss.poly) or (overlay.width/2.0, overlay.height/2.0)
+    if ss.move_segment == "distal":
+        if len(ss.dist_axis) == 2:
+            ss.dist_axis = transform_points_y_down(ss.dist_axis, ss.dx, ss.dy, ss.theta, center)
+        if len(ss.dist_joint) == 2:
+            ss.dist_joint = transform_points_y_down(ss.dist_joint, ss.dx, ss.dy, ss.theta, center)
+    else:
+        if len(ss.prox_axis) == 2:
+            ss.prox_axis = transform_points_y_down(ss.prox_axis, ss.dx, ss.dy, ss.theta, center)
+        if len(ss.prox_joint) == 2:
+            ss.prox_joint = transform_points_y_down(ss.prox_joint, ss.dx, ss.dy, ss.theta, center)
+
+# -------------------- light footer with current tool -------------------
+with st.expander("Status / help", expanded=False):
+    st.write(f"**Tool**: {ss.tool}  |  Polygon closed: {ss.poly_closed}")
+    st.write("Tip: double-clicking the first node while on Polygon closes the loop. "
+             "When closed, pick HINGE (or it falls back to polygon centroid).")
