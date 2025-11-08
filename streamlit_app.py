@@ -1,30 +1,24 @@
-
 import io
 from typing import List, Tuple, Optional
-import numpy as np
-from PIL import Image, ImageOps, ImageDraw
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+from PIL import Image, ImageDraw, ImageOps
+import numpy as np
 import pandas as pd
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Bone Tool (faithful web clone)", layout="wide")
+st.set_page_config(page_title="Osteotomy Visualizer (stable)", layout="wide")
 
-def decode_image(file_bytes):
+# ---------- helpers ----------
+def decode_image(file_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img).convert("RGBA")
     return img
 
-def polygon_mask(size, pts):
+def polygon_mask(size, points: List[Tuple[float,float]]) -> Image.Image:
     m = Image.new("L", size, 0)
-    if len(pts) >= 3:
-        ImageDraw.Draw(m).polygon(pts, fill=255, outline=255)
+    if len(points) >= 3:
+        ImageDraw.Draw(m).polygon(points, fill=255, outline=255)
     return m
-
-def apply_affine(img, dx, dy, rot_deg, center):
-    rot = img.rotate(rot_deg, resample=Image.BICUBIC, center=center, expand=False)
-    out = Image.new("RGBA", img.size, (0,0,0,0))
-    out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
-    return out
 
 def centroid(pts):
     if len(pts) < 3: return None
@@ -41,6 +35,12 @@ def centroid(pts):
     cx /= (6*a); cy /= (6*a)
     return (cx, cy)
 
+def apply_affine(img: Image.Image, dx, dy, rot_deg, center_xy):
+    rot = img.rotate(rot_deg, resample=Image.BICUBIC, center=center_xy, expand=False)
+    out = Image.new("RGBA", img.size, (0,0,0,0))
+    out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
+    return out
+
 def transform_points(points, dx, dy, angle_deg, center):
     if not points: return []
     ang = np.deg2rad(angle_deg); c,s = np.cos(ang), np.sin(ang)
@@ -53,57 +53,57 @@ def transform_points(points, dx, dy, angle_deg, center):
         out.append((float(xr), float(yr)))
     return out
 
+# ---------- UI state ----------
 ss = st.session_state
-def init():
-    ss.setdefault("poly", [])
-    ss.setdefault("prox_line", [])
-    ss.setdefault("dist_line", [])
-    ss.setdefault("cora", None)
-    ss.setdefault("hinge", None)
-    ss.setdefault("segment", "distal")
-    ss.setdefault("dx", 0)
-    ss.setdefault("dy", 0)
-    ss.setdefault("rot", 0)
-    ss.setdefault("canvas_px", 900)
-init()
+for k, v in dict(poly=[], cora=None, hinge=None, prox=[], dist=[], ruler=[],
+                 dispw=1100, dx=0, dy=0, theta=0, segment="distal").items():
+    ss.setdefault(k, v)
 
-uploaded = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg","tif","tiff"])
-tool = st.sidebar.radio("Tool", ["Polygon","HINGE","CORA","Proximal line","Distal line"], index=0)
-ss.segment = st.sidebar.radio("Move", ["distal","proximal"], index=0, horizontal=True)
-ss.dx = st.sidebar.slider("ΔX", -1000, 1000, ss.dx, 1)
-ss.dy = st.sidebar.slider("ΔY", -1000, 1000, ss.dy, 1)
-ss.rot = st.sidebar.slider("Rotate (°)", -180, 180, ss.rot, 1)
-ss.canvas_px = st.sidebar.slider("Canvas width (px)", 600, 1600, ss.canvas_px, 50)
+st.sidebar.header("Upload image")
+uploaded = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
+tool = st.sidebar.radio("Tool", ["Polygon","CORA","HINGE","Prox line","Dist line","Ruler"])
+segment = st.sidebar.radio("Move segment", ["distal","proximal"], index=(0 if ss.segment=="distal" else 1), horizontal=True, key="segment")
+ss.dispw = st.sidebar.slider("Preview width", 600, 1800, ss.dispw, 50)
+ss.dx    = st.sidebar.slider("ΔX (px)", -1000, 1000, ss.dx, 1)
+ss.dy    = st.sidebar.slider("ΔY (px)", -1000, 1000, ss.dy, 1)
+ss.theta = st.sidebar.slider("Rotate (°)", -180, 180, ss.theta, 1)
+
 c1, c2, c3, c4, c5 = st.sidebar.columns(5)
 if c1.button("Undo"):
     if tool == "Polygon" and ss.poly: ss.poly.pop()
-    elif tool == "Proximal line" and ss.prox_line: ss.prox_line.pop()
-    elif tool == "Distal line" and ss.dist_line: ss.dist_line.pop()
-    elif tool == "HINGE": ss.hinge = None
+    elif tool == "Prox line" and ss.prox: ss.prox.pop()
+    elif tool == "Dist line" and ss.dist: ss.dist.pop()
+    elif tool == "Ruler" and ss.ruler: ss.ruler.pop()
     elif tool == "CORA": ss.cora = None
+    elif tool == "HINGE": ss.hinge = None
 if c2.button("Reset poly"): ss.poly.clear()
-if c3.button("Reset lines"): ss.prox_line.clear(); ss.dist_line.clear()
+if c3.button("Reset lines"): ss.prox.clear(); ss.dist.clear()
 if c4.button("Clear centers"): ss.cora=None; ss.hinge=None
-if c5.button("Reset move"): ss.dx=0; ss.dy=0; ss.rot=0
+if c5.button("Reset move"): ss.dx=0; ss.dy=0; ss.theta=0
 
-if not uploaded:
-    st.info("Upload an image to start."); st.stop()
+if uploaded is None:
+    st.info("Upload an image to begin.")
+    st.stop()
 
+# ---------- drawing via image clicks (no fragile JS components) ----------
 img = decode_image(uploaded.getvalue())
 W, H = img.size
-scale = ss.canvas_px / float(W)
+disp_w = min(ss.dispw, W)
+scale = disp_w / float(W)
 disp_h = int(round(H*scale))
 
-bg = img.copy()
-d = ImageDraw.Draw(bg)
-if len(ss.poly) >= 2:
+# paint current overlays on a preview
+preview = img.copy()
+d = ImageDraw.Draw(preview)
+# polygon
+if ss.poly:
     d.line(ss.poly, fill=(0,255,255,255), width=2)
     if len(ss.poly) >= 3:
         d.line([*ss.poly, ss.poly[0]], fill=(0,255,255,255), width=2)
-if ss.prox_line:
-    d.line(ss.prox_line, fill=(66,133,244,255), width=3)
-if ss.dist_line:
-    d.line(ss.dist_line, fill=(221,0,221,255), width=3)
+# lines
+if len(ss.prox) == 2: d.line(ss.prox, fill=(66,133,244,255), width=3)
+if len(ss.dist) == 2: d.line(ss.dist, fill=(221,0,221,255), width=3)
+# centers
 if ss.cora:
     x,y=ss.cora; d.ellipse([x-6,y-6,x+6,y+6], outline=(0,200,0,255), width=2)
 if ss.hinge:
@@ -111,57 +111,61 @@ if ss.hinge:
     d.line([(x-12,y),(x+12,y)], fill=(255,165,0,255), width=1)
     d.line([(x,y-12),(x,y+12)], fill=(255,165,0,255), width=1)
 
-canvas_res = st_canvas(
-    background_image=bg,
-    width=ss.canvas_px,
-    height=disp_h,
-    drawing_mode="polyline" if tool in ["Polygon","Proximal line","Distal line"] else "transform",
-    stroke_width=2,
-    stroke_color="#00FFFF" if tool=="Polygon" else ("#4285F4" if tool=="Proximal line" else "#DD00DD"),
-    update_streamlit=True,
-    key="main_canvas",
-)
+disp_img = preview.resize((disp_w, disp_h), Image.NEAREST)
+res = streamlit_image_coordinates(disp_img, key="clicks", width=disp_w, css={"cursor":"crosshair"})
 
-def to_orig(x,y):
-    return (x/scale, y/scale)
+def to_orig(pt_disp): return (float(pt_disp[0]) / scale, float(pt_disp[1]) / scale)
 
-if canvas_res.json_data is not None and "objects" in canvas_res.json_data:
-    objs = canvas_res.json_data["objects"]
-    if objs:
-        last = objs[-1]
-        if tool in ["Polygon","Proximal line","Distal line"] and last.get("type") in ["line","polyline","path"]:
-            raw = last.get("path", [])
-            pts = []
-            for cmd in raw:
-                if len(cmd) >= 3:
-                    _, x, y = cmd[:3]
-                    ox, oy = to_orig(x, y)
-                    pts.append((ox, oy))
-            if tool == "Polygon":
-                ss.poly = pts
-            elif tool == "Proximal line":
-                if len(pts) >= 2: ss.prox_line = [pts[0], pts[-1]]
-            elif tool == "Distal line":
-                if len(pts) >= 2: ss.dist_line = [pts[0], pts[-1]]
+if res and "x" in res and "y" in res:
+    pt = to_orig((res["x"], res["y"]))
+    if tool == "Polygon": ss.poly.append(pt)
+    elif tool == "CORA":   ss.cora = pt
+    elif tool == "HINGE":  ss.hinge = pt
+    elif tool == "Prox line":
+        if len(ss.prox) >= 2: ss.prox.clear()
+        ss.prox.append(pt)
+    elif tool == "Dist line":
+        if len(ss.dist) >= 2: ss.dist.clear()
+        ss.dist.append(pt)
+    elif tool == "Ruler":
+        if len(ss.ruler) >= 2: ss.ruler.clear()
+        ss.ruler.append(pt)
 
+# ---------- transform preview ----------
 center = ss.hinge or ss.cora or centroid(ss.poly)
 if len(ss.poly) >= 3 and center is not None:
     m = polygon_mask(img.size, ss.poly)
     inv = ImageOps.invert(m)
     prox = Image.new("RGBA", img.size, (0,0,0,0)); prox.paste(img, (0,0), inv)
     dist = Image.new("RGBA", img.size, (0,0,0,0)); dist.paste(img, (0,0), m)
-    moving = dist if ss.segment == "distal" else prox
-    fixed  = prox if ss.segment == "distal" else dist
-    moved = apply_affine(moving, ss.dx, ss.dy, ss.rot, center)
+    moving = dist if ss.segment=="distal" else prox
+    fixed  = prox if ss.segment=="distal" else dist
+
+    moved = apply_affine(moving, ss.dx, ss.dy, ss.theta, center)
     out = Image.alpha_composite(Image.alpha_composite(Image.new("RGBA", img.size, (0,0,0,0)), fixed), moved)
+
     # redraw lines with correct following
     draw2 = ImageDraw.Draw(out)
-    if len(ss.dist_line) == 2:
-        p = transform_points(ss.dist_line, ss.dx, ss.dy, ss.rot, center) if ss.segment=="distal" else ss.dist_line
+    if len(ss.dist) == 2:
+        p = transform_points(ss.dist, ss.dx, ss.dy, ss.theta, center) if ss.segment=="distal" else ss.dist
         draw2.line(p, fill=(221,0,221,255), width=3)
-    if len(ss.prox_line) == 2:
-        p = transform_points(ss.prox_line, ss.dx, ss.dy, ss.rot, center) if ss.segment=="proximal" else ss.prox_line
+    if len(ss.prox) == 2:
+        p = transform_points(ss.prox, ss.dx, ss.dy, ss.theta, center) if ss.segment=="proximal" else ss.prox
         draw2.line(p, fill=(66,133,244,255), width=3)
-    st.image(out.resize((ss.canvas_px, disp_h), Image.NEAREST), use_container_width=True)
+
+    st.image(out.resize((disp_w, disp_h), Image.NEAREST), use_container_width=True)
+
+    # exports
+    params = dict(mode=ss.segment, dx=ss.dx, dy=ss.dy, rotate_deg=ss.theta,
+                  rotation_center=center, polygon_points=ss.poly,
+                  cora=ss.cora, hinge=ss.hinge,
+                  proximal_line=ss.prox, distal_line=ss.dist)
+    df = pd.DataFrame([params])
+    st.download_button("Download parameters CSV",
+                       data=df.to_csv(index=False).encode("utf-8"),
+                       file_name="osteotomy_params.csv", mime="text/csv")
+    buf = io.BytesIO(); out.save(buf, format="PNG")
+    st.download_button("Download transformed image (PNG)", data=buf.getvalue(),
+                       file_name="osteotomy_transformed.png", mime="image/png")
 else:
-    st.info("Draw polygon (≥3) and set HINGE/CORA; live drawing is active.")
+    st.info("Draw polygon (≥3) and set HINGE/CORA; live clicking is active.")
