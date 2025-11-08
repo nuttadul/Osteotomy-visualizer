@@ -188,7 +188,7 @@ def overlay_img() -> Image.Image:
             if len(prox_axis)==2:  prox_axis  = transform_line(prox_axis,  center_for_motion, ss.dx, ss.dy, ss.theta)
             if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, ss.dx, ss.dy, ss.theta)
 
-# inside overlay_img()
+
 def _draw_line(line: Line, col):
     if len(line)==2:
         d.line(line, fill=col, width=3)
