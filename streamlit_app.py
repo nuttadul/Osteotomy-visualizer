@@ -182,33 +182,61 @@ if tool in ("CORA","HINGE"):
             else: ss.hinge = pt
 
 # ---------- LIVE POLYGON (PowerPoint style) ----------
+def _canvas_safe(**kwargs):
+    """
+    Call st_canvas with display_ratio=1.0 when supported (fixes drift).
+    If the environment doesn't support that kwarg, fall back gracefully.
+    """
+    try:
+        # new versions support display_ratio
+        return st_canvas(display_ratio=1.0, **kwargs)
+    except TypeError:
+        # older versions don't
+        return st_canvas(**kwargs)
+
 def live_polygon(background: Image.Image, existing_pts: list, key: str) -> list:
     """Draw polygon with live preview; returns list of original-image coords."""
-    # Draw with the exact pixel size; fix drift via display_ratio=1.0
-    result = st_canvas(
-        background_image=background,
-        update_streamlit=True,
-        height=background.height,
-        width=background.width,
-        drawing_mode="polygon",
-        stroke_color="#00FFFF",
-        stroke_width=2,
-        display_ratio=1.0,          # <<— fixes any DPI/zoom drift
-        key=key,
-    )
+    # Try polygon mode first; fall back to polyline if not supported.
+    try:
+        result = _canvas_safe(
+            background_image=background,
+            update_streamlit=True,
+            height=background.height,
+            width=background.width,
+            drawing_mode="polygon",
+            stroke_color="#00FFFF",
+            stroke_width=2,
+            key=key,
+        )
+    except Exception:
+        result = _canvas_safe(
+            background_image=background,
+            update_streamlit=True,
+            height=background.height,
+            width=background.width,
+            drawing_mode="polyline",
+            stroke_color="#00FFFF",
+            stroke_width=2,
+            key=key,
+        )
+
     if result.json_data:
         objs = result.json_data.get("objects", [])
         for obj in reversed(objs):
             if obj.get("type") == "polygon":
+                return _parse_polygon(obj, scale)
+            # Fallback: polyline/path → approximate polygon by closing the path
+            if obj.get("type") in ("polyline", "path"):
                 pts = _parse_polygon(obj, scale)
+                if len(pts) >= 3 and pts[0] != pts[-1]:
+                    pts.append(pts[0])
                 if len(pts) >= 3:
                     return pts
     return existing_pts
-
-# ---------- LIVE LINE (PowerPoint style) ----------
+# ---------- LIVE Line (PowerPoint style) ----------
 def live_line(background: Image.Image, current_line: list, color: str, key: str) -> list:
     """Draw a line with live preview; returns [p0,p1] in original-image coords."""
-    result = st_canvas(
+    result = _canvas_safe(
         background_image=background,
         update_streamlit=True,
         height=background.height,
@@ -216,7 +244,6 @@ def live_line(background: Image.Image, current_line: list, color: str, key: str)
         drawing_mode="line",
         stroke_color=color,
         stroke_width=3,
-        display_ratio=1.0,          # <<— fixes any DPI/zoom drift
         key=key,
     )
     if result.json_data:
