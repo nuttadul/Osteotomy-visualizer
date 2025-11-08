@@ -79,13 +79,13 @@ def safe_width_slider(default_hint: int, uploaded_img: Optional[Image.Image]) ->
 ss = st.session_state
 defaults = dict(
     dispw=1100,
-    tool="Polygon",
+    tool="Osteotomy",  # renamed from "Polygon"
     poly=[], poly_closed=False,
     hinge=None, cora=None,
     prox_axis=[], dist_axis=[],
     prox_joint=[], dist_joint=[],
     move_segment="distal",
-    dx=0, dy=0, theta=0,
+    dx=0, dy=0, theta=0.0,
 )
 for k,v in defaults.items(): ss.setdefault(k, v)
 
@@ -95,15 +95,28 @@ up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
 
 ss.tool = st.sidebar.radio(
     "Tool",
-    ["Polygon","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"],
-    index=["Polygon","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"].index(ss.tool),
+    ["Osteotomy","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"],
+    index=["Osteotomy","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"].index(ss.tool),
 )
 
+# Delete a single selected line (non-destructive)
+st.sidebar.markdown("**Delete a single item**")
+del_choice = st.sidebar.selectbox(
+    "Choose one to clear",
+    ["(none)","Prox axis","Dist axis","Prox joint","Dist joint"]
+)
+if st.sidebar.button("Delete selected"):
+    if del_choice == "Prox axis":  ss.prox_axis = []
+    if del_choice == "Dist axis":  ss.dist_axis = []
+    if del_choice == "Prox joint": ss.prox_joint = []
+    if del_choice == "Dist joint": ss.dist_joint = []
+
+st.sidebar.markdown("---")
 c1,c2,c3,c4 = st.sidebar.columns(4)
-if c1.button("Reset poly"):   ss.poly=[]; ss.poly_closed=False
-if c2.button("Reset axes"):   ss.prox_axis=[]; ss.dist_axis=[]
-if c3.button("Reset joints"): ss.prox_joint=[]; ss.dist_joint=[]
-if c4.button("Clear points"): ss.hinge=None; ss.cora=None
+if c1.button("Reset osteotomy"): ss.poly=[]; ss.poly_closed=False
+if c2.button("Reset axes"):       ss.prox_axis=[]; ss.dist_axis=[]
+if c3.button("Reset joints"):     ss.prox_joint=[]; ss.dist_joint=[]
+if c4.button("Clear points"):     ss.hinge=None; ss.cora=None
 
 ss.move_segment = st.sidebar.radio(
     "Move which part after osteotomy?",
@@ -115,9 +128,10 @@ probe_img = load_rgba(up.getvalue()) if up else None
 ss.dispw = safe_width_slider(ss.dispw, probe_img)
 
 st.sidebar.markdown("---")
-ss.dx    = st.sidebar.slider("ΔX (px)", -1000, 1000, ss.dx, 1)
-ss.dy    = st.sidebar.slider("ΔY (px)", -1000, 1000, ss.dy, 1)
-ss.theta = st.sidebar.slider("Rotate (°)", -180, 180, ss.theta, 1)
+# Tighter, finer sliders (your request)
+ss.dx    = st.sidebar.slider("ΔX (px)", -500, 500, ss.dx, 1)
+ss.dy    = st.sidebar.slider("ΔY (px)", -500, 500, ss.dy, 1)
+ss.theta = st.sidebar.slider("Rotate (°)", -60.0, 60.0, float(ss.theta), 0.2)
 
 # ---------------- main ----------------
 if not up:
@@ -151,13 +165,12 @@ def overlay_img() -> Image.Image:
     img = composite.convert("RGBA")
     d = ImageDraw.Draw(img, "RGBA")
 
-    # polygon (nodes + edges)
+    # osteotomy polygon (nodes + edges)
     if ss.poly:
         if len(ss.poly) >= 2:
             d.line(ss.poly, fill=(0,255,255,255), width=2)
         if ss.poly_closed and len(ss.poly) >= 3:
             d.line([ss.poly[-1], ss.poly[0]], fill=(0,255,255,255), width=2)
-        # draw every node so the first click is visible
         for p in ss.poly:
             d.ellipse([p[0]-4, p[1]-4, p[0]+4, p[1]+4], fill=(0,255,255,200))
 
@@ -173,21 +186,32 @@ def overlay_img() -> Image.Image:
             if len(prox_axis)==2:  prox_axis  = transform_line(prox_axis,  center_for_motion, ss.dx, ss.dy, ss.theta)
             if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, ss.dx, ss.dy, ss.theta)
 
-    def _draw_line(line: Line, col):
+    def _draw_line(line: Line, col, label: str):
         # show first point immediately
         if len(line) >= 1:
             p0 = line[0]
             d.ellipse([p0[0]-4, p0[1]-4, p0[0]+4, p0[1]+4], fill=col)
-        # draw full segment when we have two points
+        # draw full segment + label when we have two points
         if len(line) == 2:
             d.line(line, fill=col, width=3)
             for p in line:
-                d.ellipse([p[0]-4, p[1]-4, p[0]+4, p[1]+4], fill=col)
+                d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=col)
+            # named angle tag at midpoint
+            mid = ((line[0][0]+line[1][0])/2.0, (line[0][1]+line[1][1])/2.0)
+            a = angle_deg(line[0], line[1])
+            text = f"{label}: {a:.1f}°"
+            # small dark bubble near the line
+            pad = 4
+            tw, th = 8*len(text)*0.6, 16  # rough width estimate (no font metrics)
+            bx0, by0 = mid[0]+6, mid[1]-8
+            bx1, by1 = bx0 + tw + pad*2, by0 + th
+            d.rectangle([bx0,by0,bx1,by1], fill=(0,0,0,160))
+            d.text((bx0+pad, by0+2), text, fill=(255,255,255,230))
 
-    _draw_line(prox_axis, (66,133,244,255))
-    _draw_line(dist_axis, (221,0,221,255))
-    _draw_line(prox_joint,(255,215,0,220))
-    _draw_line(dist_joint,(255,215,0,220))
+    _draw_line(prox_axis, (66,133,244,255), "prox axis")
+    _draw_line(dist_axis, (221,0,221,255), "dist axis")
+    _draw_line(prox_joint,(255,215,0,220), "prox joint")
+    _draw_line(dist_joint,(255,215,0,220), "dist joint")
 
     if ss.hinge:
         x,y = ss.hinge
@@ -197,23 +221,9 @@ def overlay_img() -> Image.Image:
     if ss.cora:
         x,y=ss.cora; d.ellipse([x-6,y-6,x+6,y+6], outline=(0,200,0,255), width=2)
 
-    # angle readouts
-    def _label(line: Line, y):
-        if len(line)==2:
-            a = angle_deg(line[0], line[1])
-            d.rectangle([6,y-12,220,y+6], fill=(0,0,0,150))
-            d.text((10,y-10), f"angle {a:.1f}°", fill=(255,255,255,230))
-    y=8
-    if len(prox_joint)==2: _label(prox_joint, y); y+=18
-    if len(dist_joint)==2: _label(dist_joint, y); y+=18
-    if len(prox_axis)==2:  _label(prox_axis,  y); y+=18
-    if len(dist_axis)==2:  _label(dist_axis,  y); y+=18
-
     return img.convert("RGB")  # JPEG-friendly (no alpha)
 
 overlay_rgb = overlay_img()
-
-# IMPORTANT: use size[0], not .width (avoids AttributeError in some envs)
 click = streamlit_image_coordinates(overlay_rgb, width=overlay_rgb.size[0], key="click")
 
 # --- click handling (instant: update state and rerun) ---
@@ -221,7 +231,7 @@ if click and "x" in click and "y" in click:
     px, py = float(click["x"]), float(click["y"])
     p = (px, py)
 
-    if ss.tool == "Polygon":
+    if ss.tool == "Osteotomy":
         if not ss.poly_closed:
             if len(ss.poly) >= 3:
                 x0,y0 = ss.poly[0]
@@ -260,6 +270,8 @@ if click and "x" in click and "y" in click:
     st.rerun()
 
 with st.expander("Status / help", expanded=False):
-    st.write(f"**Tool**: {ss.tool}  |  Polygon closed: {ss.poly_closed}")
+    st.write(f"**Tool**: {ss.tool}  |  Osteotomy closed: {ss.poly_closed}")
     st.write("First click places a node immediately; second click completes the segment. "
-             "Close polygon by clicking within ~10 px of the first node. The chosen segment’s axes/joints follow the fragment.")
+             "Close the osteotomy by clicking within ~10 px of the first node. "
+             "Rotation slider is ±60° (0.2° step); ΔX/ΔY are ±500 px. "
+             "Use 'Delete selected' to clear only one line.")
