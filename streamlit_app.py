@@ -138,7 +138,7 @@ with left:
         stroke_width=width_px,
         stroke_color=stroke_color,
         background_color=None,                 # we use locked image object instead
-        initial_drawing=json.dumps(initial_drawing),
+        initial_drawing=initial_drawing, 
         update_streamlit=True,
         width=cw, height=ch,
         drawing_mode=drawing_mode,
