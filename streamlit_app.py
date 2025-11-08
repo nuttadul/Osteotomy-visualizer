@@ -42,17 +42,7 @@ def safe_canvas(bg_img, drawing_mode, stroke_color, stroke_width, key, width, he
         display_toolbar=True,
         drawing_mode=drawing_mode,
     )
-    except Exception:
-        return st_canvas(
-            background_image=np.array(bg_img.convert("RGB")),
-            stroke_color=stroke_color,
-            stroke_width=stroke_width,
-            width=width,
-            height=height,
-            update_streamlit=True,
-            key=key,
-            display_toolbar=True,
-        )
+  
 
 def parse_line(obj):
     return [(float(obj.get("x1",0)), float(obj.get("y1",0))),
