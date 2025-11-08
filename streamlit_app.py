@@ -26,20 +26,36 @@ def vec_angle(v1, v2):
 
 def safe_canvas(bg_img, drawing_mode, stroke_color, stroke_width, key, width, height):
     """
-    Universal Streamlit Drawable Canvas background handler.
-    Works for all environments — converts PIL image to base64 data URL.
+    Guaranteed working background loader: uses initial_drawing image object
+    instead of background_image param.
     """
+
     import io, base64
 
-    # Convert PIL → base64 data URL
+    # Convert background to base64 (Fabric.js image object)
     buf = io.BytesIO()
     bg_img.convert("RGB").save(buf, format="PNG")
     data = base64.b64encode(buf.getvalue()).decode("utf-8")
     data_url = f"data:image/png;base64,{data}"
 
-    # Pass as data URL string to st_canvas
+    # Fabric.js initial_drawing to lock background image
+    initial_drawing = {
+        "version": "5.2.4",
+        "objects": [{
+            "type": "image",
+            "left": 0, "top": 0,
+            "width": width, "height": height,
+            "scaleX": 1, "scaleY": 1,
+            "src": data_url,
+            "selectable": False,
+            "evented": False,
+            "hasControls": False,
+            "hasBorders": False,
+        }]
+    }
+
+    # Render canvas (with no background_image param)
     return st_canvas(
-        background_image=data_url,
         fill_color="rgba(0,0,0,0)",
         background_color=None,
         stroke_color=stroke_color,
@@ -49,9 +65,9 @@ def safe_canvas(bg_img, drawing_mode, stroke_color, stroke_width, key, width, he
         update_streamlit=True,
         key=key,
         display_toolbar=True,
+        initial_drawing=initial_drawing,
         drawing_mode=drawing_mode,
     )
-  
 
 def parse_line(obj):
     return [(float(obj.get("x1",0)), float(obj.get("y1",0))),
