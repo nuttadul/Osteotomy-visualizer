@@ -167,7 +167,7 @@ MAP_TO_INTERNAL = {
 }
 # Pick index based on previous internal tool
 internal_to_display = {v:k for k,v in MAP_TO_INTERNAL.items()}
-default_display = internal_to_display.get(ss.tool, "Osteotomy polygon")
+default_display = internal_to_display.get(ss.tool, "Proximal joint orientation line")
 display_index = TOOL_LABELS.index(default_display)
 
 display_choice = st.sidebar.radio("Tool", TOOL_LABELS, index=display_index)
