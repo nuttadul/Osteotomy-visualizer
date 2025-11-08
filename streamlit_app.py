@@ -1,30 +1,28 @@
-# streamlit_app.py
-import io, math
+# app.py
+import io, base64, json, math
 from typing import List, Tuple
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
 import streamlit as st
-
-# Pin a compatible version in requirements.txt:
-# streamlit
-# Pillow
-# numpy
-# streamlit-drawable-canvas==0.9.3
-
 from streamlit_drawable_canvas import st_canvas
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Osteotomy – robust canvas", layout="wide")
+st.set_page_config(page_title="Osteotomy – canvas with real background", layout="wide")
 
-# ---------------- utils ----------------
+# ---------------- helpers ----------------
 def load_rgba(b: bytes) -> Image.Image:
     im = Image.open(io.BytesIO(b))
     return ImageOps.exif_transpose(im).convert("RGBA")
 
-def to_rgb(im: Image.Image) -> Image.Image:
-    return im.convert("RGB") if im.mode != "RGB" else im
+def pil_to_dataurl(img: Image.Image, fmt="PNG") -> str:
+    """Encode a PIL image to data URL for Fabric 'image' object."""
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/{fmt.lower()};base64,{b64}"
 
-def draw_persisted(base_rgba: Image.Image,
-                   poly, prox, dist, cora, hinge) -> Image.Image:
+def draw_overlay(base_rgba: Image.Image,
+                 poly, prox, dist, cora, hinge) -> Image.Image:
     out = base_rgba.copy()
     d = ImageDraw.Draw(out, "RGBA")
     if len(poly) >= 3:
@@ -47,7 +45,7 @@ def parse_line(obj):
             (float(obj.get("x2",0)), float(obj.get("y2",0)))]
 
 def parse_points(obj):
-    # Prefer 'points'
+    # Prefer Fabric.js 'points'
     if "points" in obj and isinstance(obj["points"], list):
         left = float(obj.get("left",0)); top = float(obj.get("top",0))
         sx = float(obj.get("scaleX",1)); sy = float(obj.get("scaleY",1))
@@ -70,13 +68,14 @@ def d2(a,b): x=a[0]-b[0]; y=a[1]-b[1]; return x*x+y*y
 
 # ---------------- state ----------------
 ss = st.session_state
-defaults = dict(poly=[], prox=[], dist=[], cora=None, hinge=None,
-                tool="Polygon", preview_w=1100, snap_px=10, nonce=0)
-for k,v in defaults.items(): ss.setdefault(k,v)
+for k,v in dict(poly=[], prox=[], dist=[], cora=None, hinge=None,
+                tool="Polygon", preview_w=1100, snap_px=12, nonce=0).items():
+    ss.setdefault(k,v)
 
 st.sidebar.header("Upload image")
 up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
-ss.tool      = st.sidebar.radio("Tool", ["Polygon","Prox line","Dist line"], index=0)
+
+ss.tool      = st.sidebar.radio("Tool", ["Polygon","Prox line","Dist line","CORA","HINGE"], index=0)
 ss.preview_w = st.sidebar.slider("Preview width", 600, 1800, ss.preview_w, 50)
 ss.snap_px   = st.sidebar.slider("Polygon snap distance (px)", 4, 20, int(ss.snap_px), 1)
 
@@ -89,58 +88,73 @@ if not up:
     st.info("Upload an image to begin.")
     st.stop()
 
-# ------------- prepare base preview -------------
+# --------- image + scale ----------
 src_rgba = load_rgba(up.getvalue())
 W,H = src_rgba.size
 scale = min(ss.preview_w/float(W), 1.0)
 cw,ch = int(round(W*scale)), int(round(H*scale))
 base_rgba = src_rgba.resize((cw,ch), Image.NEAREST)
 
-# draw persisted geometry into the background image itself
-bg_rgba = draw_persisted(base_rgba, ss.poly, ss.prox, ss.dist, ss.cora, ss.hinge)
-bg_rgb  = to_rgb(bg_rgba)              # <-- many canvas builds need plain RGB
+# Fabric background image (locked object via initial_drawing)
+bg_dataurl = pil_to_dataurl(base_rgba.convert("RGB"))
+initial_drawing = {
+    "version": "5.2.4",
+    "objects": [{
+        "type": "image",
+        "left": 0, "top": 0,
+        "width": cw, "height": ch,
+        "scaleX": 1, "scaleY": 1,
+        "angle": 0,
+        "flipX": False, "flipY": False,
+        "opacity": 1,
+        "src": bg_dataurl,
+        "selectable": False,
+        "evented": False,
+        "hasControls": False,
+        "hasBorders": False,
+        "objectCaching": False
+    }]
+}
 
-# ----------- choose mode & stroke ------------
+# --------- UI layout ----------
+left, right = st.columns([1.1, 1])
+left.subheader("Live drawing (with real image background)")
+right.subheader("Preview (persisted shapes; click here for CORA/HINGE)")
+
+# ---------- Canvas (works even if background_image is ignored) ----------
 if ss.tool == "Polygon":
-    drawing_mode = "polyline"          # we auto-close by snapping
-    stroke_color = "#00FFFF"; stroke_width = 2
+    drawing_mode = "polyline"; stroke_color = "#00FFFF"; width_px = 2
 elif ss.tool == "Prox line":
-    drawing_mode = "line"; stroke_color = "#4285F4"; stroke_width = 3
+    drawing_mode = "line";     stroke_color = "#4285F4"; width_px = 3
+elif ss.tool == "Dist line":
+    drawing_mode = "line";     stroke_color = "#DD00DD"; width_px = 3
 else:
-    drawing_mode = "line"; stroke_color = "#DD00DD"; stroke_width = 3
+    drawing_mode = "transform"   # idle
+    stroke_color = "#00FFFF"; width_px = 1
 
-# ----------- SAFEST call form ---------------
-# Pass ALL canonical parameters, always.
-def call_canvas_with(bg):
-    return st_canvas(
+with left:
+    result = st_canvas(
         fill_color="rgba(0,0,0,0)",
-        stroke_width=stroke_width,
+        stroke_width=width_px,
         stroke_color=stroke_color,
-        background_color="#ffffff",        # ignored when background_image is set
-        background_image=bg,               # PIL RGB or NumPy HxWx3
+        background_color=None,                 # we use locked image object instead
+        initial_drawing=json.dumps(initial_drawing),
         update_streamlit=True,
-        width=cw,
-        height=ch,
+        width=cw, height=ch,
         drawing_mode=drawing_mode,
         key=f"canvas-{ss.nonce}-{ss.tool}",
+        display_toolbar=True,
     )
 
-# 1) PIL RGB (preferred by many builds)
-try:
-    result = call_canvas_with(bg_rgb)
-except Exception:
-    # 2) NumPy fallback
-    try:
-        result = call_canvas_with(np.array(bg_rgb, dtype=np.uint8))
-    except Exception:
-        # 3) Last resort: no image → at least tool won’t crash
-        result = call_canvas_with(None)
-
-# ----------- read canvas output --------------
-if result.json_data:
+# Read back the canvas only for drawing tools
+if result.json_data and ss.tool in ("Polygon","Prox line","Dist line"):
     objs = result.json_data.get("objects", [])
+    # We drew the image as the 1st object; usable shapes are later objects.
+    # Scan from the end to get the most recent line/polyline.
     for obj in reversed(objs):
         typ = obj.get("type","")
+        if typ == "image":
+            continue
         if ss.tool == "Polygon" and typ in ("polyline","path","polygon"):
             pts = parse_points(obj)
             if len(pts) >= 2:
@@ -158,6 +172,17 @@ if result.json_data:
             else: ss.dist = seg_full
             break
 
-# ------------- show persisted overlay -------------
-st.markdown("### Preview (stored overlay)")
-st.image(draw_persisted(src_rgba, ss.poly, ss.prox, ss.dist, ss.cora, ss.hinge).resize((cw,ch), Image.NEAREST))
+# ---------- Preview + click-to-set CORA / HINGE ----------
+with right:
+    preview_rgba = draw_overlay(base_rgba, ss.poly, ss.prox, ss.dist, ss.cora, ss.hinge)
+    if ss.tool in ("CORA","HINGE"):
+        st.caption("Click anywhere on the image to set the point.")
+        res = streamlit_image_coordinates(preview_rgba, width=cw, key=f"clicks-{ss.nonce}")
+        if res and "x" in res and "y" in res:
+            pt = (float(res["x"])/scale, float(res["y"])/scale)
+            if ss.tool == "CORA":  ss.cora  = pt
+            if ss.tool == "HINGE": ss.hinge = pt
+            ss.nonce += 1
+            st.experimental_rerun()
+    else:
+        st.image(preview_rgba, width=cw)
