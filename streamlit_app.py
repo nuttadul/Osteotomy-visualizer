@@ -6,6 +6,89 @@ import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 from streamlit_image_coordinates import streamlit_image_coordinates
 
+import numpy as np
+
+def safe_canvas(background_pil, *, drawing_mode, stroke_color, stroke_width, key, width, height, update_streamlit=True):
+    """
+    Call st_canvas in a way that works across old/new component builds.
+    Tries (A) PIL + display_ratio, (B) PIL without display_ratio,
+         (C) NumPy array background, (D) no background (last resort).
+    Returns the st_canvas result.
+    """
+    from streamlit_drawable_canvas import st_canvas
+
+    # prepare numpy fallback once
+    bg_np = np.array(background_pil.convert("RGB"))
+
+    # A) PIL + display_ratio (best: fixes Hi-DPI drift)
+    try:
+        return st_canvas(
+            background_image=background_pil,
+            display_ratio=1.0,
+            background_color="#ffffff",
+            fill_color="rgba(0,0,0,0)",
+            drawing_mode=drawing_mode,
+            stroke_color=stroke_color,
+            stroke_width=stroke_width,
+            update_streamlit=update_streamlit,
+            width=width,
+            height=height,
+            key=key,
+            display_toolbar=True,
+        )
+    except TypeError:
+        pass  # display_ratio not supported
+
+    # B) PIL without display_ratio
+    try:
+        return st_canvas(
+            background_image=background_pil,
+            background_color="#ffffff",
+            fill_color="rgba(0,0,0,0)",
+            drawing_mode=drawing_mode,
+            stroke_color=stroke_color,
+            stroke_width=stroke_width,
+            update_streamlit=update_streamlit,
+            width=width,
+            height=height,
+            key=key,
+            display_toolbar=True,
+        )
+    except Exception:
+        pass
+
+    # C) NumPy background
+    try:
+        return st_canvas(
+            background_image=bg_np,
+            background_color="#ffffff",
+            fill_color="rgba(0,0,0,0)",
+            drawing_mode=drawing_mode,
+            stroke_color=stroke_color,
+            stroke_width=stroke_width,
+            update_streamlit=update_streamlit,
+            width=width,
+            height=height,
+            key=key,
+            display_toolbar=True,
+        )
+    except Exception:
+        pass
+
+    # D) Last resort: no background (you’ll still see it in the right-hand preview)
+    return st_canvas(
+        background_color="#ffffff",
+        fill_color="rgba(0,0,0,0)",
+        drawing_mode=drawing_mode,
+        stroke_color=stroke_color,
+        stroke_width=stroke_width,
+        update_streamlit=update_streamlit,
+        width=width,
+        height=height,
+        key=key,
+        display_toolbar=True,
+    )
+
 st.set_page_config(page_title="Osteotomy – live canvas over real image", layout="wide")
 
 # ---------- helpers ----------
@@ -107,20 +190,16 @@ else:
 with left:
     # IMPORTANT: display_ratio=1.0 fixes Hi-DPI drift (mismatch) and
     # using background_image avoids polygon component errors.
-    result = st_canvas(
-        background_image=disp_img.convert("RGB"),
-        background_color="#ffffff",          # keeps component happy
-        display_ratio=1.0,                   # <<< key to matching coordinates
-        fill_color="rgba(0,0,0,0)",
-        stroke_color=stroke_color,
-        stroke_width=stroke_w,
-        drawing_mode=drawing_mode,
-        update_streamlit=True,
-        width=cw, height=ch,
-        key=f"canvas-{ss.nonce}-{tool}",
-        display_toolbar=True,
-    )
-
+    result = safe_canvas(
+    background_pil=disp_img,                  # PIL image
+    drawing_mode=drawing_mode,
+    stroke_color=stroke_color,
+    stroke_width=stroke_w,
+    key=f"canvas-{ss.nonce}-{tool}",
+    width=cw,
+    height=ch,
+    update_streamlit=True,
+)
 # ---------- capture shapes from canvas (persist in ORIGINAL coords) ----------
 if result.json_data and tool in ("Polygon","Prox line","Dist line"):
     objs = result.json_data.get("objects", [])
