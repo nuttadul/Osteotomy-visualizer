@@ -25,20 +25,23 @@ def vec_angle(v1, v2):
     return min(deg, 180 - deg if deg > 180 else deg)
 
 def safe_canvas(bg_img, drawing_mode, stroke_color, stroke_width, key, width, height):
-    try:
-        return st_canvas(
-            background_image=bg_img,
-            display_ratio=1.0,
-            fill_color="rgba(0,0,0,0)",
-            background_color=None,
-            stroke_color=stroke_color,
-            stroke_width=stroke_width,
-            width=width,
-            height=height,
-            update_streamlit=True,
-            key=key,
-            display_toolbar=True,
-        )
+    """Always show background image — compatible with all Streamlit versions."""
+    import numpy as np
+    bg_np = np.array(bg_img.convert("RGB"))  # convert PIL → NumPy array
+    
+    return st_canvas(
+        background_image=bg_np,
+        fill_color="rgba(0,0,0,0)",
+        background_color=None,
+        stroke_color=stroke_color,
+        stroke_width=stroke_width,
+        width=width,
+        height=height,
+        update_streamlit=True,
+        key=key,
+        display_toolbar=True,
+        drawing_mode=drawing_mode,
+    )
     except Exception:
         return st_canvas(
             background_image=np.array(bg_img.convert("RGB")),
