@@ -190,16 +190,10 @@ def overlay_img() -> Image.Image:
 
 # inside overlay_img()
 def _draw_line(line: Line, col):
-    # Show first point immediately (snappy feedback)
-    if len(line) >= 1:
-        p0 = line[0]
-        d.ellipse([p0[0]-4, p0[1]-4, p0[0]+4, p0[1]+4], fill=col)
-
-    # When both endpoints exist, draw the line + both endpoints
-    if len(line) == 2:
+    if len(line)==2:
         d.line(line, fill=col, width=3)
         for p in line:
-            d.ellipse([p[0]-4, p[1]-4, p[0]+4, p[1]+4], fill=col)
+            d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=col)
 
     _draw_line(prox_axis, (66,133,244,255))
     _draw_line(dist_axis, (221,0,221,255))
