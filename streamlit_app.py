@@ -4,7 +4,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+from streamlit_drawable_canvas_fork import st_canvas
 import pandas as pd
 
 st.set_page_config(page_title="Bone Tool (faithful web clone)", layout="wide")
