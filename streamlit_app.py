@@ -5,11 +5,11 @@ from PIL import Image, ImageDraw, ImageOps
 import numpy as np
 import pandas as pd
 from streamlit_image_coordinates import streamlit_image_coordinates
-from streamlit_drawable_canvas import st_canvas   # <-- live line preview
+from streamlit_drawable_canvas import st_canvas  # live preview canvas
 
 st.set_page_config(page_title="Osteotomy (Streamlit)", layout="wide")
 
-# ---------- helpers ----------
+# ---------------- helpers ----------------
 def decode_image(file_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img).convert("RGBA")
@@ -64,7 +64,7 @@ def make_display_image(base_img: Image.Image, disp_w: int, state) -> tuple[Image
     show = base_img.resize((int(round(W*scale)), disp_h), Image.NEAREST).copy()
     d = ImageDraw.Draw(show)
 
-    # polygon
+    # polygon (persisted)
     if state.poly:
         poly_disp = [(p[0]*scale, p[1]*scale) for p in state.poly]
         d.line(poly_disp, fill=(0,255,255,255), width=2)
@@ -93,7 +93,33 @@ def make_display_image(base_img: Image.Image, disp_w: int, state) -> tuple[Image
 
     return show, scale
 
-# ---------- state ----------
+# --- helpers to read canvas shapes back to original coords ---
+def _parse_line(obj, scale):
+    x1, y1 = obj.get("x1", 0), obj.get("y1", 0)
+    x2, y2 = obj.get("x2", 0), obj.get("y2", 0)
+    return [(x1/scale, y1/scale), (x2/scale, y2/scale)]
+
+def _parse_polygon(obj, scale):
+    # try 'path' first (absolute path commands)
+    if "path" in obj and isinstance(obj["path"], list):
+        pts = []
+        for cmd in obj["path"]:
+            if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] in ("M","L"):
+                pts.append((cmd[1]/scale, cmd[2]/scale))
+        return pts
+    # fallback to 'points' (+ left/top)
+    if "points" in obj and isinstance(obj["points"], list):
+        left = obj.get("left", 0); top = obj.get("top", 0)
+        sx = obj.get("scaleX", 1.0); sy = obj.get("scaleY", 1.0)
+        pts = []
+        for p in obj["points"]:
+            px = left + sx * p.get("x", 0)
+            py = top + sy * p.get("y", 0)
+            pts.append((px/scale, py/scale))
+        return pts
+    return []
+
+# ---------------- state ----------------
 ss = st.session_state
 defaults = dict(
     poly=[], cora=None, hinge=None, prox=[], dist=[],
@@ -122,7 +148,7 @@ ss.theta  = st.sidebar.slider("Rotate (°)", -180, 180, ss.theta, 1)
 
 c1, c2, c3, c4, c5 = st.sidebar.columns(5)
 if c1.button("Undo"):
-    if tool == "Polygon" and ss.poly: ss.poly.pop()
+    if tool == "Polygon" and ss.poly: ss.poly.clear()  # polygon is multi-point; undo clears for simplicity
     elif tool == "Prox line" and ss.prox: ss.prox.clear()
     elif tool == "Dist line" and ss.dist: ss.dist.clear()
     elif tool == "CORA": ss.cora = None
@@ -139,56 +165,72 @@ if uploaded is None:
 img = decode_image(uploaded.getvalue())
 st.markdown("<style>.stImage img{cursor: crosshair !important;}</style>", unsafe_allow_html=True)
 
-# ---------- preview image (for polygon & centers) ----------
+# ---------- base preview (used as background for canvas tools) ----------
 disp_img, scale = make_display_image(img, ss.dispw, ss)
 
 def to_orig(pt_disp): return (float(pt_disp[0])/scale, float(pt_disp[1])/scale)
 
-# polygon / center tools still use precise click points
-if tool in ("Polygon","CORA","HINGE"):
+# ---------- CORA / HINGE (click points) ----------
+if tool in ("CORA","HINGE"):
     res = streamlit_image_coordinates(disp_img, width=disp_img.width, key=f"clicks-{ss.click_nonce}")
     if res and "x" in res and "y" in res:
         event = (res["x"], res["y"], disp_img.width, disp_img.height)
         if event != ss.last_event:
             ss.last_event = event
             pt = to_orig((res["x"], res["y"]))
-            if tool == "Polygon":
-                ss.poly.append(pt)
-            elif tool == "CORA":
-                ss.cora = pt
-            elif tool == "HINGE":
-                ss.hinge = pt
+            if tool == "CORA": ss.cora = pt
+            else: ss.hinge = pt
 
-# ---------- live line tools (PowerPoint-style) ----------
-def live_line(background: Image.Image, current_line: list, color: str, key: str) -> list:
-    """Return [p0,p1] in ORIGINAL coords after user draws/updates a line."""
-    bg = background.copy()
-    # A faint guide: previously drawn polygon/lines already baked into background
-    canvas_result = st_canvas(
-        background_image=bg,
+# ---------- LIVE POLYGON (PowerPoint style) ----------
+def live_polygon(background: Image.Image, existing_pts: list, key: str) -> list:
+    """Draw polygon with live preview; returns list of original-image coords."""
+    # Draw with the exact pixel size; fix drift via display_ratio=1.0
+    result = st_canvas(
+        background_image=background,
         update_streamlit=True,
-        height=bg.height,
-        width=bg.width,
+        height=background.height,
+        width=background.width,
+        drawing_mode="polygon",
+        stroke_color="#00FFFF",
+        stroke_width=2,
+        display_ratio=1.0,          # <<— fixes any DPI/zoom drift
+        key=key,
+    )
+    if result.json_data:
+        objs = result.json_data.get("objects", [])
+        for obj in reversed(objs):
+            if obj.get("type") == "polygon":
+                pts = _parse_polygon(obj, scale)
+                if len(pts) >= 3:
+                    return pts
+    return existing_pts
+
+# ---------- LIVE LINE (PowerPoint style) ----------
+def live_line(background: Image.Image, current_line: list, color: str, key: str) -> list:
+    """Draw a line with live preview; returns [p0,p1] in original-image coords."""
+    result = st_canvas(
+        background_image=background,
+        update_streamlit=True,
+        height=background.height,
+        width=background.width,
         drawing_mode="line",
         stroke_color=color,
         stroke_width=3,
+        display_ratio=1.0,          # <<— fixes any DPI/zoom drift
         key=key,
     )
-    # Parse last line from fabric.js objects
-    if canvas_result.json_data is not None:
-        objs = canvas_result.json_data.get("objects", [])
-        # pick the last line object
+    if result.json_data:
+        objs = result.json_data.get("objects", [])
         for obj in reversed(objs):
             if obj.get("type") == "line":
-                x1, y1 = obj.get("x1", 0), obj.get("y1", 0)
-                x2, y2 = obj.get("x2", 0), obj.get("y2", 0)
-                # map back to original coords
-                p0 = (x1/scale, y1/scale)
-                p1 = (x2/scale, y2/scale)
-                return [p0, p1]
+                return _parse_line(obj, scale)
     return current_line
 
-if tool == "Prox line":
+# switch tools
+if tool == "Polygon":
+    ss.poly = live_polygon(disp_img, ss.poly, key=f"canvas-poly-{ss.click_nonce}")
+
+elif tool == "Prox line":
     ss.prox = live_line(disp_img, ss.prox, "#4285F4", key=f"canvas-prox-{ss.click_nonce}")
 
 elif tool == "Dist line":
@@ -208,7 +250,7 @@ if len(ss.poly) >= 3 and center is not None:
     moved = apply_affine(moving, ss.dx, ss.dy, ss.theta, center)
     out = Image.alpha_composite(Image.alpha_composite(Image.new("RGBA", img.size, (0,0,0,0)), fixed), moved)
 
-    # redraw persisted lines, moving with their segment
+    # redraw lines; each follows its own segment
     draw2 = ImageDraw.Draw(out)
     if len(ss.dist) == 2:
         p = transform_points_screen(ss.dist, ss.dx, ss.dy, ss.theta, center) if ss.segment=="distal" else ss.dist
@@ -234,4 +276,4 @@ if len(ss.poly) >= 3 and center is not None:
                        data=buf.getvalue(), file_name="osteotomy_transformed.png",
                        mime="image/png", key="png")
 else:
-    st.info("Draw polygon (≥3) and set HINGE/CORA. Use Prox/Dist line tools to draw with a live preview (drag). Lines persist until you reset.")
+    st.info("Draw polygon (≥3) and set HINGE/CORA. Use Prox/Dist line tools to draw with a live preview (drag). Lines and polygon persist until you reset.")
