@@ -6,10 +6,10 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps, ImageDraw
 
-# --- canvas component ---
+# live canvas
 from streamlit_drawable_canvas import st_canvas
 
-st.set_page_config(page_title="Osteotomy (static background + live canvas)", layout="wide")
+st.set_page_config(page_title="Osteotomy – canvas over static background", layout="wide")
 
 # ---------------- helpers ----------------
 def decode_image(file_bytes: bytes) -> Image.Image:
@@ -41,7 +41,6 @@ def polygon_mask(size, pts: List[Tuple[float,float]]) -> Image.Image:
     return m
 
 def apply_affine(img: Image.Image, dx, dy, rot_deg, center_xy):
-    # rotate CCW in screen coords (y down)
     rot = img.rotate(rot_deg, resample=Image.BICUBIC, center=center_xy, expand=False)
     out = Image.new("RGBA", img.size, (0,0,0,0))
     out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
@@ -61,13 +60,12 @@ def transform_points_screen(points, dx, dy, angle_deg, center):
     return out
 
 def close_if_near_first(pts_disp: List[Tuple[float, float]], snap_px: float = 10.0):
-    """Return (closed_flag, possibly_closed_pts_disp)."""
     if len(pts_disp) < 3:
         return False, pts_disp
     x0,y0 = pts_disp[0]
     xn,yn = pts_disp[-1]
     if (x0-xn)**2 + (y0-yn)**2 <= snap_px**2:
-        return True, pts_disp[:-1]  # drop the repeated last point
+        return True, pts_disp[:-1]
     return False, pts_disp
 
 # ---- parse helpers (canvas → original-image coords) ----
@@ -77,7 +75,7 @@ def _line_points_from_obj(obj, scale):
     return [(x1/scale,y1/scale),(x2/scale,y2/scale)]
 
 def _polygon_points_from_obj(obj, scale):
-    # path (absolute commands)
+    # path (absolute M/L commands)
     if "path" in obj and isinstance(obj["path"], list):
         pts = []
         for cmd in obj["path"]:
@@ -95,6 +93,80 @@ def _polygon_points_from_obj(obj, scale):
             pts.append((px/scale, py/scale))
         return pts
     return []
+
+# ---------- SAFE canvas wrapper ----------
+def safe_st_canvas(*, background_image, width, height, drawing_mode,
+                   stroke_color, stroke_width, key):
+    """
+    Calls st_canvas but tolerates version differences:
+      - Try with display_ratio=1.0 (+ numpy background)
+      - Try without display_ratio
+      - Try with PIL.Image background
+      - Fallback to polyline if polygon mode unsupported
+    """
+    bg = background_image
+    dm = drawing_mode
+
+    def _call(**k):
+        # most reliable combo first
+        try:
+            return st_canvas(display_ratio=1.0, **k)
+        except TypeError:
+            return st_canvas(**k)
+
+    # 1) numpy + requested mode
+    try:
+        return _call(background_image=bg, width=width, height=height,
+                     drawing_mode=dm, stroke_color=stroke_color,
+                     stroke_width=stroke_width, key=key,
+                     background_color="#ffffff", update_streamlit=True)
+    except Exception:
+        pass
+
+    # 2) numpy + polyline (if polygon not supported)
+    if dm == "polygon":
+        try:
+            return _call(background_image=bg, width=width, height=height,
+                         drawing_mode="polyline", stroke_color=stroke_color,
+                         stroke_width=stroke_width, key=key,
+                         background_color="#ffffff", update_streamlit=True)
+        except Exception:
+            pass
+
+    # 3) PIL background
+    if isinstance(bg, np.ndarray):
+        try:
+            bg_pil = Image.fromarray(bg)
+        except Exception:
+            bg_pil = None
+    else:
+        bg_pil = bg
+
+    if bg_pil is not None:
+        # 3a) PIL + requested mode
+        try:
+            return _call(background_image=bg_pil, width=width, height=height,
+                         drawing_mode=dm, stroke_color=stroke_color,
+                         stroke_width=stroke_width, key=key,
+                         background_color="#ffffff", update_streamlit=True)
+        except Exception:
+            pass
+        # 3b) PIL + polyline
+        if dm == "polygon":
+            try:
+                return _call(background_image=bg_pil, width=width, height=height,
+                             drawing_mode="polyline", stroke_color=stroke_color,
+                             stroke_width=stroke_width, key=key,
+                             background_color="#ffffff", update_streamlit=True)
+            except Exception:
+                pass
+
+    # final fallback: create a blank white background (should never be reached)
+    blank = np.ones((height, width, 3), dtype=np.uint8) * 255
+    return _call(background_image=blank, width=width, height=height,
+                 drawing_mode="polyline" if dm == "polygon" else dm,
+                 stroke_color=stroke_color, stroke_width=stroke_width,
+                 key=key, background_color="#ffffff", update_streamlit=True)
 
 # ---------- state ----------
 ss = st.session_state
@@ -153,51 +225,45 @@ W,H = img_rgba.size
 scale = min(ss.dispw/float(W), 1.0)
 disp_size = (int(round(W*scale)), int(round(H*scale)))
 disp_rgb = img_rgba.convert("RGB").resize(disp_size, Image.NEAREST)
-bg_np = np.array(disp_rgb)     # STATIC BACKGROUND LAYER
+bg_np = np.array(disp_rgb)   # static background
 
-# ---------- live canvas over static background ----------
-# one canvas, same key → shapes persist while switching tools
+# picking drawing mode
 drawing_mode = {
-    "Polygon":   "polygon",
+    "Polygon":   "polygon",       # wrapper will fallback to 'polyline' if needed
     "Prox line": "line",
     "Dist line": "line",
-    "CORA":      "transform",    # no drawing; we use click on background
-    "HINGE":     "transform",
+    "CORA":      None,            # no drawing, just clicks
+    "HINGE":     None,
 }[tool]
 
-# If tool is CORA/HINGE we still show the canvas (no drawing), so user can click image.
-result = st_canvas(
-    background_image=bg_np,            # STATIC BACKGROUND (no logic attached)
-    width=disp_size[0], height=disp_size[1],
-    drawing_mode=None if tool in ("CORA","HINGE") else drawing_mode,
-    key="main-canvas",
+# ---------- LIVE CANVAS (safe) ----------
+result = safe_st_canvas(
+    background_image=bg_np,
+    width=disp_size[0],
+    height=disp_size[1],
+    drawing_mode=drawing_mode,
     stroke_color="#00FFFF" if tool=="Polygon" else "#4285F4" if tool=="Prox line" else "#DD00DD",
     stroke_width=3,
-    update_streamlit=True,
-    display_ratio=1.0,                 # avoid DPI drift
-    background_color="#ffffff",        # safety for older builds
+    key="main-canvas",
 )
 
 # ---------- read shapes & update state ----------
-# We never mutate the background; we only read the overlay layer and keep our own clean state.
 def _to_orig(pt_disp): return (pt_disp[0]/scale, pt_disp[1]/scale)
 
-if result.json_data:
+if result and result.json_data:
     objs = result.json_data.get("objects", [])
 
-    # Read polygon (take the most recent polygon/polyline/path)
+    # polygon / polyline / path
     for obj in reversed(objs):
         if obj.get("type") in ("polygon","polyline","path"):
-            pts_disp = []
             if obj["type"]=="polygon":
-                # fabric polygon points:
-                pts_disp = []
                 left = obj.get("left",0); top=obj.get("top",0)
                 sx = obj.get("scaleX",1.0); sy=obj.get("scaleY",1.0)
+                pts_disp=[]
                 for p in obj.get("points", []):
                     pts_disp.append((left + sx*p.get("x",0), top + sy*p.get("y",0)))
             else:
-                # path/polyline
+                pts_disp=[]
                 for cmd in obj.get("path", []):
                     if isinstance(cmd,list) and len(cmd)>=3 and cmd[0] in ("M","L"):
                         pts_disp.append((cmd[1], cmd[2]))
@@ -207,33 +273,29 @@ if result.json_data:
                 ss.poly_closed = closed
             break
 
-    # Read latest two lines (blue=prox, magenta=dist) by order / color
-    # We simply keep the most recent line for the active tool type.
+    # lines
     for obj in reversed(objs):
         if obj.get("type") == "line":
-            p = _line_points_from_obj(obj, scale=1.0)  # in display coords
-            # convert to original coords
-            p = [ _to_orig(pt) for pt in p ]
+            p_disp = [(obj.get("x1",0), obj.get("y1",0)),
+                      (obj.get("x2",0), obj.get("y2",0))]
+            p = [ _to_orig(pt) for pt in p_disp ]
             if tool == "Prox line":
                 ss.prox = p
             elif tool == "Dist line":
                 ss.dist = p
             break
 
-    # Read point clicks for CORA / HINGE
-    if tool in ("CORA","HINGE") and result.last_point is not None:
-        px,py = result.last_point["x"], result.last_point["y"]
+    # CORA / HINGE click
+    last_pt = getattr(result, "last_point", None)
+    if tool in ("CORA","HINGE") and last_pt is not None:
+        px,py = last_pt["x"], last_pt["y"]
         if tool=="CORA": ss.cora = _to_orig((px,py))
         else:            ss.hinge = _to_orig((px,py))
 
-# ---------- render preview (backend) ----------
-center = ss.hinge or ss.cora or (centroid(ss.poly) if ss.poly_closed else None)
-
-# make overlay display to show markers/lines on top of the background
+# ---------- overlay preview ----------
 overlay = disp_rgb.copy()
 d = ImageDraw.Draw(overlay)
 
-# draw persisted polygon/lines/points on preview
 if ss.poly:
     poly_disp = [(p[0]*scale, p[1]*scale) for p in ss.poly]
     if len(poly_disp)>=2:
@@ -255,23 +317,21 @@ if ss.hinge:
     d.line([(x-10,y),(x+10,y)], fill=(255,165,0), width=1)
     d.line([(x,y-10),(x,y+10)], fill=(255,165,0), width=1)
 
-st.image(overlay, caption="Drawing layer preview (static background + live overlay)", use_container_width=False)
+st.image(overlay, caption="Live overlay on static background", use_container_width=False)
 
-# final composite + downloads when polygon is closed and we have a center
+# ---------- backend transform + download ----------
+center = ss.hinge or ss.cora or (centroid(ss.poly) if ss.poly_closed else None)
+
 if ss.poly_closed and center is not None:
     img = img_rgba
-
     m = polygon_mask(img.size, ss.poly)
     inv = ImageOps.invert(m)
-
     prox_img = Image.new("RGBA", img.size, (0,0,0,0)); prox_img.paste(img, (0,0), inv)
     dist_img = Image.new("RGBA", img.size, (0,0,0,0)); dist_img.paste(img, (0,0), m)
-
     moving = dist_img if ss.segment=="distal" else prox_img
     fixed  = prox_img if ss.segment=="distal" else dist_img
-
-    moved = apply_affine(moving, ss.dx, ss.dy, ss.theta, center)
-    out   = Image.alpha_composite(Image.alpha_composite(Image.new("RGBA", img.size, (0,0,0,0)), fixed), moved)
+    moved  = apply_affine(moving, ss.dx, ss.dy, ss.theta, center)
+    out    = Image.alpha_composite(Image.alpha_composite(Image.new("RGBA", img.size, (0,0,0,0)), fixed), moved)
 
     # redraw lines according to which segment moves
     draw2 = ImageDraw.Draw(out)
@@ -285,7 +345,6 @@ if ss.poly_closed and center is not None:
     disp_out = out.resize(disp_size, Image.NEAREST)
     st.image(disp_out, caption="Transformed preview", use_container_width=False)
 
-    # downloads
     params = dict(
         mode=ss.segment, dx=ss.dx, dy=ss.dy, rotate_deg=ss.theta,
         rotation_center=center, polygon_points=ss.poly,
@@ -309,4 +368,4 @@ if ss.poly_closed and center is not None:
         key="png"
     )
 else:
-    st.info("Draw polygon (Polygon tool). To close the loop, click near the first vertex (auto-close). Then set CORA/HINGE if you like and move a segment.")
+    st.info("Draw polygon. To close it, click near the first vertex (auto-close). Then set CORA/HINGE and move a segment.")
