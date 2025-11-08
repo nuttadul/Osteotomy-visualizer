@@ -89,7 +89,12 @@ if not up:
     st.stop()
 
 # ---------- sizing: one scale for both canvas and preview ----------
-origW, origH = img.size
+# --------- image + scale ----------
+src_rgba = load_rgba(up.getvalue())
+W, H = src_rgba.size
+scale = min(ss.preview_w / float(W), 1.0)
+cw, ch = int(round(W * scale)), int(round(H * scale))
+base_rgba = src_rgba.resize((cw, ch), Image.NEAREST)
 cw = min(ss.dispw, origW)                 # canvas width
 scale = cw / float(origW)                 # single source of truth
 ch = int(round(origH * scale))            # canvas height
