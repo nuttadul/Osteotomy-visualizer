@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Osteotomy Visualizer (stable)", layout="wide")
+st.set_page_config(page_title="Osteotomy (Streamlit)", layout="wide")
 
 # ---------- helpers ----------
 def decode_image(file_bytes: bytes) -> Image.Image:
@@ -53,7 +53,7 @@ def transform_points(points, dx, dy, angle_deg, center):
         out.append((float(xr), float(yr)))
     return out
 
-# ---------- UI state ----------
+# ---------- UI & state ----------
 ss = st.session_state
 for k, v in dict(poly=[], cora=None, hinge=None, prox=[], dist=[], ruler=[],
                  dispw=1100, dx=0, dy=0, theta=0, segment="distal").items():
@@ -61,7 +61,7 @@ for k, v in dict(poly=[], cora=None, hinge=None, prox=[], dist=[], ruler=[],
 
 st.sidebar.header("Upload image")
 uploaded = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
-tool = st.sidebar.radio("Tool", ["Polygon","CORA","HINGE","Prox line","Dist line","Ruler"])
+tool = st.sidebar.radio("Tool", ["Polygon","CORA","HINGE","Prox line","Dist line","Ruler"], index=0)
 segment = st.sidebar.radio("Move segment", ["distal","proximal"], index=(0 if ss.segment=="distal" else 1), horizontal=True, key="segment")
 ss.dispw = st.sidebar.slider("Preview width", 600, 1800, ss.dispw, 50)
 ss.dx    = st.sidebar.slider("ΔX (px)", -1000, 1000, ss.dx, 1)
@@ -85,25 +85,24 @@ if uploaded is None:
     st.info("Upload an image to begin.")
     st.stop()
 
-# ---------- drawing via image clicks (no fragile JS components) ----------
 img = decode_image(uploaded.getvalue())
 W, H = img.size
 disp_w = min(ss.dispw, W)
 scale = disp_w / float(W)
 disp_h = int(round(H*scale))
 
-# paint current overlays on a preview
+# crosshair cursor for better pointing
+st.markdown("<style>img{cursor: crosshair !important;}</style>", unsafe_allow_html=True)
+
+# paint overlays for preview
 preview = img.copy()
 d = ImageDraw.Draw(preview)
-# polygon
 if ss.poly:
     d.line(ss.poly, fill=(0,255,255,255), width=2)
     if len(ss.poly) >= 3:
         d.line([*ss.poly, ss.poly[0]], fill=(0,255,255,255), width=2)
-# lines
 if len(ss.prox) == 2: d.line(ss.prox, fill=(66,133,244,255), width=3)
 if len(ss.dist) == 2: d.line(ss.dist, fill=(221,0,221,255), width=3)
-# centers
 if ss.cora:
     x,y=ss.cora; d.ellipse([x-6,y-6,x+6,y+6], outline=(0,200,0,255), width=2)
 if ss.hinge:
@@ -112,7 +111,7 @@ if ss.hinge:
     d.line([(x,y-12),(x,y+12)], fill=(255,165,0,255), width=1)
 
 disp_img = preview.resize((disp_w, disp_h), Image.NEAREST)
-res = streamlit_image_coordinates(disp_img, key="clicks", width=disp_w, css={"cursor":"crosshair"})
+res = streamlit_image_coordinates(disp_img, width=disp_w, key="clicks")
 
 def to_orig(pt_disp): return (float(pt_disp[0]) / scale, float(pt_disp[1]) / scale)
 
@@ -144,7 +143,7 @@ if len(ss.poly) >= 3 and center is not None:
     moved = apply_affine(moving, ss.dx, ss.dy, ss.theta, center)
     out = Image.alpha_composite(Image.alpha_composite(Image.new("RGBA", img.size, (0,0,0,0)), fixed), moved)
 
-    # redraw lines with correct following
+    # redraw lines with following
     draw2 = ImageDraw.Draw(out)
     if len(ss.dist) == 2:
         p = transform_points(ss.dist, ss.dx, ss.dy, ss.theta, center) if ss.segment=="distal" else ss.dist
@@ -155,7 +154,6 @@ if len(ss.poly) >= 3 and center is not None:
 
     st.image(out.resize((disp_w, disp_h), Image.NEAREST), use_container_width=True)
 
-    # exports
     params = dict(mode=ss.segment, dx=ss.dx, dy=ss.dy, rotate_deg=ss.theta,
                   rotation_center=center, polygon_points=ss.poly,
                   cora=ss.cora, hinge=ss.hinge,
@@ -168,4 +166,4 @@ if len(ss.poly) >= 3 and center is not None:
     st.download_button("Download transformed image (PNG)", data=buf.getvalue(),
                        file_name="osteotomy_transformed.png", mime="image/png")
 else:
-    st.info("Draw polygon (≥3) and set HINGE/CORA; live clicking is active.")
+    st.info("Draw polygon (≥3) and set HINGE/CORA; clicking is active.")
