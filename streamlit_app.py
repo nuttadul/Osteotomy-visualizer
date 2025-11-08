@@ -43,47 +43,34 @@ def centroid(pts: List[Pt]) -> Optional[Pt]:
 def apply_affine_fragment(moving: Image.Image,
                           dx: float, dy: float,
                           rot_deg: float, center_xy: Pt) -> Image.Image:
+    # Pillow rotate is CCW in screen (y-down) coordinates
     rot = moving.rotate(rot_deg, resample=Image.BICUBIC, center=center_xy, expand=False)
     out = Image.new("RGBA", moving.size, (0,0,0,0))
     out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
     return out
 
-def rotate_point(p: Tuple[float, float], center: Tuple[float, float], deg: float) -> Tuple[float, float]:
-    """Rotate point p around center by +deg using SCREEN (y-down) coordinates.
-
-    Matches Pillow's rotate(+deg), which is visually CCW on screen.
-    """
+def rotate_point(p: Pt, center: Pt, deg: float) -> Pt:
+    """Rotate point p around center by +deg using SCREEN (y-down) coordinates."""
     ang = math.radians(deg)
     c, s = math.cos(ang), math.sin(ang)
     cx, cy = center
     x, y = p[0] - cx, p[1] - cy
-    # y-down rotation matrix (same as used for the image fragment)
     xr =  x * c + y * s
     yr = -x * s + y * c
     return (cx + xr, cy + yr)
 
-def transform_line(line: List[Tuple[float, float]],
-                   center: Tuple[float, float],
-                   dx: float, dy: float, theta: float) -> List[Tuple[float, float]]:
-    """Rotate line around center by +theta (y-down CCW), then translate by (dx, dy)."""
+def transform_line(line: Line, center: Pt, dx: float, dy: float, theta: float) -> Line:
     p0 = rotate_point(line[0], center, theta)
     p1 = rotate_point(line[1], center, theta)
     return [(p0[0] + dx, p0[1] + dy), (p1[0] + dx, p1[1] + dy)]
 
 def safe_width_slider(default_hint: int, uploaded_img: Optional[Image.Image]) -> int:
-    """
-    Build a width slider that never throws:
-    - min_value = 200
-    - max_value = min(1800, image_width) but at least 201
-    - default clamped into [min,max]
-    """
     min_w = 200
     if uploaded_img is None:
         max_w = 1200
     else:
         iw = uploaded_img.size[0]
         max_w = max(min_w + 1, min(1800, iw))
-
     default = max(min_w + 1, min(default_hint, max_w))
     return st.sidebar.slider("Preview width", min_value=min_w, max_value=max_w,
                              value=default, step=50)
@@ -124,11 +111,7 @@ ss.move_segment = st.sidebar.radio(
     index=0 if ss.move_segment=="distal" else 1
 )
 
-# We need the image (or a stub) to size safely
-probe_img = None
-if up:   # load a tiny header only (cheap)
-    probe_img = load_rgba(up.getvalue())
-
+probe_img = load_rgba(up.getvalue()) if up else None
 ss.dispw = safe_width_slider(ss.dispw, probe_img)
 
 st.sidebar.markdown("---")
@@ -170,9 +153,11 @@ def overlay_img() -> Image.Image:
 
     # polygon (nodes + edges)
     if ss.poly:
-        if len(ss.poly) >= 2: d.line(ss.poly, fill=(0,255,255,255), width=2)
+        if len(ss.poly) >= 2:
+            d.line(ss.poly, fill=(0,255,255,255), width=2)
         if ss.poly_closed and len(ss.poly) >= 3:
             d.line([ss.poly[-1], ss.poly[0]], fill=(0,255,255,255), width=2)
+        # draw every node so the first click is visible
         for p in ss.poly:
             d.ellipse([p[0]-4, p[1]-4, p[0]+4, p[1]+4], fill=(0,255,255,200))
 
@@ -189,10 +174,15 @@ def overlay_img() -> Image.Image:
             if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, ss.dx, ss.dy, ss.theta)
 
     def _draw_line(line: Line, col):
-        if len(line)==2:
+        # show first point immediately
+        if len(line) >= 1:
+            p0 = line[0]
+            d.ellipse([p0[0]-4, p0[1]-4, p0[0]+4, p0[1]+4], fill=col)
+        # draw full segment when we have two points
+        if len(line) == 2:
             d.line(line, fill=col, width=3)
             for p in line:
-                d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=col)
+                d.ellipse([p[0]-4, p[1]-4, p[0]+4, p[1]+4], fill=col)
 
     _draw_line(prox_axis, (66,133,244,255))
     _draw_line(dist_axis, (221,0,221,255))
@@ -219,10 +209,12 @@ def overlay_img() -> Image.Image:
     if len(prox_axis)==2:  _label(prox_axis,  y); y+=18
     if len(dist_axis)==2:  _label(dist_axis,  y); y+=18
 
-    return img.convert("RGB")  # ensure RGB (avoids JPEG alpha errors)
+    return img.convert("RGB")  # JPEG-friendly (no alpha)
 
 overlay_rgb = overlay_img()
-click = streamlit_image_coordinates(overlay_rgb, width=overlay_rgb.width, key="click")
+
+# IMPORTANT: use size[0], not .width (avoids AttributeError in some envs)
+click = streamlit_image_coordinates(overlay_rgb, width=overlay_rgb.size[0], key="click")
 
 # --- click handling (instant: update state and rerun) ---
 if click and "x" in click and "y" in click:
@@ -265,11 +257,9 @@ if click and "x" in click and "y" in click:
     elif ss.tool == "CORA":
         ss.cora = p
 
-    # immediate refresh (no second click needed)
     st.rerun()
 
 with st.expander("Status / help", expanded=False):
     st.write(f"**Tool**: {ss.tool}  |  Polygon closed: {ss.poly_closed}")
-    st.write("Close polygon by clicking within ~10 px of the first node. "
-             "Hinge is the rotation center; the selected movement segment’s axes/joints follow the fragment.")
-
+    st.write("First click places a node immediately; second click completes the segment. "
+             "Close polygon by clicking within ~10 px of the first node. The chosen segment’s axes/joints follow the fragment.")
