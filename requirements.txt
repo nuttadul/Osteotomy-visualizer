@@ -1,5 +1,5 @@
-streamlit
-Pillow
-numpy
+streamlit==1.36.0
+streamlit-drawable-canvas==0.9.3
+Pillow<10
+numpy<2
 pandas
-streamlit-image-coordinates
