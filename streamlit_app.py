@@ -1,5 +1,6 @@
 # streamlit_app.py
-# Osteotomy visualizer — robust PIL-only canvas wrapper
+# Osteotomy visualizer — hardened canvas (opaque RGB background) + always-closed polygon
+
 import io, math
 from typing import List, Tuple
 
@@ -11,17 +12,15 @@ import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 from streamlit_drawable_canvas import st_canvas
 
-
 st.set_page_config(page_title="Osteotomy (Streamlit)", layout="wide")
 
-
-# ---------- helpers ----------
+# ---------------- helpers ----------------
 def decode_image(file_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img).convert("RGBA")
     return img
 
-def polygon_mask(size, pts: List[Tuple[float, float]]) -> Image.Image:
+def polygon_mask(size, pts: List[Tuple[float,float]]) -> Image.Image:
     m = Image.new("L", size, 0)
     if len(pts) >= 3:
         ImageDraw.Draw(m).polygon(pts, fill=255, outline=255)
@@ -68,12 +67,14 @@ def make_display_image(base_img: Image.Image, disp_w: int, state) -> tuple[Image
     show = base_img.resize((int(round(W*scale)), disp_h), Image.NEAREST).copy()
     d = ImageDraw.Draw(show)
 
+    # polygon (persisted)
     if state.poly:
         poly_disp = [(p[0]*scale, p[1]*scale) for p in state.poly]
         d.line(poly_disp, fill=(0,255,255,255), width=2)
         if len(poly_disp) >= 3:
             d.line([*poly_disp, poly_disp[0]], fill=(0,255,255,255), width=2)
 
+    # persisted lines
     if len(state.prox) == 2:
         d.line([(state.prox[0][0]*scale, state.prox[0][1]*scale),
                 (state.prox[1][0]*scale, state.prox[1][1]*scale)],
@@ -83,6 +84,7 @@ def make_display_image(base_img: Image.Image, disp_w: int, state) -> tuple[Image
                 (state.dist[1][0]*scale, state.dist[1][1]*scale)],
                fill=(221,0,221,255), width=3)
 
+    # centers
     if state.cora:
         x,y=state.cora; x*=scale; y*=scale
         d.ellipse([x-6,y-6,x+6,y+6], outline=(0,200,0,255), width=2)
@@ -94,63 +96,69 @@ def make_display_image(base_img: Image.Image, disp_w: int, state) -> tuple[Image
 
     return show, scale
 
-# ---------- canvas parsing ----------
+# --- parse Fabric objects ---
 def _parse_line(obj, scale):
     x1, y1 = obj.get("x1", 0), obj.get("y1", 0)
     x2, y2 = obj.get("x2", 0), obj.get("y2", 0)
     return [(x1/scale, y1/scale), (x2/scale, y2/scale)]
 
 def _parse_polygon(obj, scale):
+    # try path first
     if "path" in obj and isinstance(obj["path"], list):
         pts=[]
         for cmd in obj["path"]:
-            if isinstance(cmd, list) and len(cmd)>=3 and cmd[0] in ("M","L"):
+            if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] in ("M","L"):
                 pts.append((cmd[1]/scale, cmd[2]/scale))
         return pts
+    # then points + left/top
     if "points" in obj and isinstance(obj["points"], list):
         left = obj.get("left", 0); top = obj.get("top", 0)
         sx = obj.get("scaleX", 1.0); sy = obj.get("scaleY", 1.0)
         pts=[]
         for p in obj["points"]:
-            px = left + sx*p.get("x", 0)
-            py = top + sy*p.get("y", 0)
+            px = left + sx * p.get("x", 0)
+            py = top + sy * p.get("y", 0)
             pts.append((px/scale, py/scale))
         return pts
     return []
 
-def _auto_close_poly_if_near_first(pts_orig: List[Tuple[float,float]], scale: float, threshold_px: float = 10.0):
-    if len(pts_orig) < 3: return pts_orig
-    p0 = (pts_orig[0][0]*scale, pts_orig[0][1]*scale)
-    pN = (pts_orig[-1][0]*scale, pts_orig[-1][1]*scale)
-    if math.hypot(pN[0]-p0[0], pN[1]-p0[1]) <= threshold_px and pts_orig[-1] != pts_orig[0]:
-        return pts_orig + [pts_orig[0]]
-    return pts_orig
+def _force_closed(pts: List[Tuple[float,float]]) -> List[Tuple[float,float]]:
+    if len(pts) >= 3 and pts[0] != pts[-1]:
+        return pts + [pts[0]]
+    return pts
 
-# ---------- PIL-only canvas wrapper ----------
-def canvas_pil(background_pil: Image.Image, *, drawing_mode, stroke_color, stroke_width, width, height, key):
-    """Call st_canvas with a PIL image; try with/without explicit size."""
-    bg = background_pil.convert("RGB")  # ensure PIL RGB
+# ---------- hardened canvas wrapper ----------
+def _opaque_rgb_background(img_disp: Image.Image) -> Image.Image:
+    """Composite disp image onto opaque white RGB (no alpha)."""
+    rgb = Image.new("RGB", img_disp.size, (255,255,255))
+    # paste respects alpha of source (disp image may carry alpha from original RGBA)
+    rgb.paste(img_disp.convert("RGBA"), (0,0))
+    return rgb
+
+def draw_on_canvas(img_disp: Image.Image, *, drawing_mode: str, stroke_color: str, stroke_width: int, key: str):
+    """Always provide a solid RGB PIL image as background. Try with/without explicit size."""
+    bg_rgb = _opaque_rgb_background(img_disp)
+    W, H = bg_rgb.size
     try:
         return st_canvas(
-            background_image=bg,
+            background_image=bg_rgb,
             drawing_mode=drawing_mode,
             stroke_color=stroke_color,
             stroke_width=stroke_width,
-            width=width,
-            height=height,
+            width=W, height=H,
             key=key,
         )
     except TypeError:
-        # Some strict builds don’t accept width/height explicitly.
+        # fallback for stricter builds
         return st_canvas(
-            background_image=bg,
+            background_image=bg_rgb,
             drawing_mode=drawing_mode,
             stroke_color=stroke_color,
             stroke_width=stroke_width,
             key=key,
         )
 
-# ---------- session state ----------
+# ---------- state ----------
 ss = st.session_state
 defaults = dict(
     poly=[], cora=None, hinge=None, prox=[], dist=[],
@@ -162,8 +170,10 @@ for k,v in defaults.items(): ss.setdefault(k, v)
 # ---------- sidebar ----------
 st.sidebar.header("Upload image")
 uploaded = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
+
 tool = st.sidebar.radio("Tool", ["Polygon","CORA","HINGE","Prox line","Dist line"], index=0)
 
+# reset event stream when switching tools
 if ss.tool_prev != tool:
     ss.click_nonce += 1
     ss.tool_prev = tool
@@ -195,10 +205,11 @@ if uploaded is None:
 img = decode_image(uploaded.getvalue())
 st.markdown("<style>.stImage img{cursor: crosshair !important;}</style>", unsafe_allow_html=True)
 
+# base preview
 disp_img, scale = make_display_image(img, ss.dispw, ss)
 def to_orig(pt_disp): return (float(pt_disp[0])/scale, float(pt_disp[1])/scale)
 
-# ---------- CORA / HINGE ----------
+# CORA / HINGE (click)
 if tool in ("CORA","HINGE"):
     res = streamlit_image_coordinates(disp_img, width=disp_img.width, key=f"clicks-{ss.click_nonce}")
     if res and "x" in res and "y" in res:
@@ -209,12 +220,11 @@ if tool in ("CORA","HINGE"):
             if tool == "CORA": ss.cora = pt
             else: ss.hinge = pt
 
-# ---------- Live tools (Polygon / Lines) ----------
+# Live tools (polygon + lines)
 if tool == "Polygon":
-    result = canvas_pil(
+    result = draw_on_canvas(
         disp_img, drawing_mode="polygon",
         stroke_color="#00FFFF", stroke_width=2,
-        width=disp_img.width, height=disp_img.height,
         key=f"poly-{ss.click_nonce}"
     )
     new_poly = ss.poly
@@ -223,17 +233,16 @@ if tool == "Polygon":
         for obj in reversed(objs):
             if obj.get("type") in ("polygon","polyline","path"):
                 pts = _parse_polygon(obj, scale)
-                pts = _auto_close_poly_if_near_first(pts, scale, threshold_px=10.0)
+                pts = _force_closed(pts)           # <— always close
                 if len(pts) >= 3:
                     new_poly = pts
                 break
     ss.poly = new_poly
 
 elif tool == "Prox line":
-    result = canvas_pil(
+    result = draw_on_canvas(
         disp_img, drawing_mode="line",
         stroke_color="#4285F4", stroke_width=3,
-        width=disp_img.width, height=disp_img.height,
         key=f"prox-{ss.click_nonce}"
     )
     new_line = ss.prox
@@ -246,10 +255,9 @@ elif tool == "Prox line":
     ss.prox = new_line
 
 elif tool == "Dist line":
-    result = canvas_pil(
+    result = draw_on_canvas(
         disp_img, drawing_mode="line",
         stroke_color="#DD00DD", stroke_width=3,
-        width=disp_img.width, height=disp_img.height,
         key=f"dist-{ss.click_nonce}"
     )
     new_line = ss.dist
@@ -261,7 +269,7 @@ elif tool == "Dist line":
                 break
     ss.dist = new_line
 
-# ---------- Transform + display ----------
+# Transform + display
 center = ss.hinge or ss.cora or centroid(ss.poly)
 if len(ss.poly) >= 3 and center is not None:
     m = polygon_mask(img.size, ss.poly)
@@ -275,6 +283,7 @@ if len(ss.poly) >= 3 and center is not None:
     moved = apply_affine(moving, ss.dx, ss.dy, ss.theta, center)
     out = Image.alpha_composite(Image.alpha_composite(Image.new("RGBA", img.size, (0,0,0,0)), fixed), moved)
 
+    # redraw lines
     draw2 = ImageDraw.Draw(out)
     if len(ss.dist) == 2:
         p = transform_points_screen(ss.dist, ss.dx, ss.dy, ss.theta, center) if ss.segment=="distal" else ss.dist
@@ -286,6 +295,7 @@ if len(ss.poly) >= 3 and center is not None:
     disp_out = out.resize((disp_img.width, disp_img.height), Image.NEAREST)
     st.image(disp_out, width=disp_img.width)
 
+    # downloads
     params = dict(mode=ss.segment, dx=ss.dx, dy=ss.dy, rotate_deg=ss.theta,
                   rotation_center=center, polygon_points=ss.poly,
                   cora=ss.cora, hinge=ss.hinge,
@@ -300,5 +310,4 @@ if len(ss.poly) >= 3 and center is not None:
                        mime="image/png", key="png")
 else:
     st.image(disp_img, width=disp_img.width)
-    st.info("Draw polygon (≥3) and set HINGE/CORA. Use Prox/Dist line tools to draw with a live preview. "
-            "Lines and polygon persist until you reset.")
+    st.info("Draw polygon (≥3) and set HINGE/CORA. Prox/Dist lines are live. Polygon is auto-closed.")
