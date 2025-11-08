@@ -75,11 +75,73 @@ def safe_width_slider(default_hint: int, uploaded_img: Optional[Image.Image]) ->
     return st.sidebar.slider("Preview width", min_value=min_w, max_value=max_w,
                              value=default, step=50)
 
+# ----- vector / geometry helpers for angles & intersections -----
+def _vec(p0: Pt, p1: Pt) -> Pt:
+    return (p1[0]-p0[0], p1[1]-p0[1])
+
+def _norm(v: Pt) -> float:
+    return (v[0]**2 + v[1]**2) ** 0.5
+
+def _unit(v: Pt) -> Pt:
+    n = _norm(v)
+    if n == 0: return (0.0, 0.0)
+    return (v[0]/n, v[1]/n)
+
+def _perp(v: Pt) -> Pt:
+    # 90° CCW in screen coords
+    return (-v[1], v[0])
+
+def angle_between_lines(l1: Line, l2: Line) -> Optional[Tuple[float,float]]:
+    """Return (small, large) angles in degrees between two infinite lines (0..180)."""
+    if len(l1)!=2 or len(l2)!=2: return None
+    v1 = _unit(_vec(l1[0], l1[1]))
+    v2 = _unit(_vec(l2[0], l2[1]))
+    if _norm(v1)==0 or _norm(v2)==0: return None
+    dot = v1[0]*v2[0] + v1[1]*v2[1]
+    dot = max(-1.0, min(1.0, dot))
+    small = math.degrees(math.acos(dot))  # 0..180
+    large = 180.0 - small
+    return (small, large)
+
+def line_intersection(l1: Line, l2: Line) -> Optional[Pt]:
+    """Intersection of infinite lines; returns None if parallel/degenerate."""
+    if len(l1)!=2 or len(l2)!=2: return None
+    x1,y1 = l1[0]; x2,y2 = l1[1]
+    x3,y3 = l2[0]; x4,y4 = l2[1]
+    den = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+    if abs(den) < 1e-9: return None
+    px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / den
+    py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / den
+    return (px, py)
+
+def bubble(d: ImageDraw.ImageDraw, anchor: Pt, text: str):
+    """Small dark label near a point."""
+    pad = 4
+    # crude text width estimate; avoids font dependency
+    tw = max(40, int(8 * max(1, len(text)) * 0.55))
+    th = 16
+    bx0, by0 = anchor[0] + 8, anchor[1] - 8
+    bx1, by1 = bx0 + tw + pad*2, by0 + th
+    d.rectangle([bx0,by0,bx1,by1], fill=(0,0,0,170))
+    d.text((bx0+pad, by0+2), text, fill=(255,255,255,230))
+
+# ----- map sliders (ΔX ⟂ prox axis, ΔY ∥ prox axis) to screen dx,dy -----
+def map_sliders_to_screen(dx_slider: float, dy_slider: float, prox_axis: Line) -> Tuple[float,float]:
+    """ΔY moves parallel to proximal axis, ΔX moves perpendicular (CCW 90°)."""
+    if len(prox_axis) == 2:
+        v = _unit(_vec(prox_axis[0], prox_axis[1]))      # parallel
+        n = _unit(_perp(v))                               # perpendicular (CCW)
+        dx = dx_slider * n[0] + dy_slider * v[0]
+        dy = dx_slider * n[1] + dy_slider * v[1]
+        return (dx, dy)
+    # fallback to screen axes if prox axis missing
+    return (dx_slider, dy_slider)
+
 # ---------------- state ----------------
 ss = st.session_state
 defaults = dict(
     dispw=1100,
-    tool="Osteotomy",  # renamed from "Polygon"
+    tool="Osteotomy",
     poly=[], poly_closed=False,
     hinge=None, cora=None,
     prox_axis=[], dist_axis=[],
@@ -90,6 +152,8 @@ defaults = dict(
 for k,v in defaults.items(): ss.setdefault(k, v)
 
 # ---------------- sidebar ----------------
+st.sidebar.title("Osteotomy visualizer")  # << title requested
+
 st.sidebar.header("Load image")
 up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
 
@@ -99,7 +163,6 @@ ss.tool = st.sidebar.radio(
     index=["Osteotomy","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"].index(ss.tool),
 )
 
-# Delete a single selected line (non-destructive)
 st.sidebar.markdown("**Delete a single item**")
 del_choice = st.sidebar.selectbox(
     "Choose one to clear",
@@ -128,9 +191,8 @@ probe_img = load_rgba(up.getvalue()) if up else None
 ss.dispw = safe_width_slider(ss.dispw, probe_img)
 
 st.sidebar.markdown("---")
-# Tighter, finer sliders (your request)
-ss.dx    = st.sidebar.slider("ΔX (px)", -500, 500, ss.dx, 1)
-ss.dy    = st.sidebar.slider("ΔY (px)", -500, 500, ss.dy, 1)
+ss.dx    = st.sidebar.slider("ΔX (⟂ prox axis)  px", -500, 500, ss.dx, 1)
+ss.dy    = st.sidebar.slider("ΔY (∥ prox axis) px", -500, 500, ss.dy, 1)
 ss.theta = st.sidebar.slider("Rotate (°)", -60.0, 60.0, float(ss.theta), 0.2)
 
 # ---------------- main ----------------
@@ -143,6 +205,9 @@ W,H = img.size
 scale = min(ss.dispw/float(W), 1.0)
 disp = img.resize((int(round(W*scale)), int(round(H*scale))), Image.NEAREST)
 
+# Map sliders to screen displacement using proximal axis
+dx_screen, dy_screen = map_sliders_to_screen(ss.dx, ss.dy, ss.prox_axis)
+
 # --- build composite (apply osteotomy in display space) ---
 composite = disp.copy()
 center_for_motion: Pt = ss.hinge or centroid(ss.poly) or (disp.size[0]/2.0, disp.size[1]/2.0)
@@ -154,7 +219,7 @@ if ss.poly_closed and len(ss.poly) >= 3:
     dist = Image.new("RGBA", disp.size, (0,0,0,0)); dist.paste(disp, (0,0), m)
     moving = dist if ss.move_segment=="distal" else prox
     fixed  = prox if ss.move_segment=="distal" else dist
-    moved  = apply_affine_fragment(moving, ss.dx, ss.dy, ss.theta, center_for_motion)
+    moved  = apply_affine_fragment(moving, dx_screen, dy_screen, ss.theta, center_for_motion)
     base   = Image.new("RGBA", disp.size, (0,0,0,0))
     base.alpha_composite(fixed)
     base.alpha_composite(moved)
@@ -180,38 +245,55 @@ def overlay_img() -> Image.Image:
 
     if ss.poly_closed and len(ss.poly) >= 3:
         if ss.move_segment == "distal":
-            if len(dist_axis)==2:  dist_axis  = transform_line(dist_axis,  center_for_motion, ss.dx, ss.dy, ss.theta)
-            if len(dist_joint)==2: dist_joint = transform_line(dist_joint, center_for_motion, ss.dx, ss.dy, ss.theta)
+            if len(dist_axis)==2:  dist_axis  = transform_line(dist_axis,  center_for_motion, dx_screen, dy_screen, ss.theta)
+            if len(dist_joint)==2: dist_joint = transform_line(dist_joint, center_for_motion, dx_screen, dy_screen, ss.theta)
         else:
-            if len(prox_axis)==2:  prox_axis  = transform_line(prox_axis,  center_for_motion, ss.dx, ss.dy, ss.theta)
-            if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, ss.dx, ss.dy, ss.theta)
+            if len(prox_axis)==2:  prox_axis  = transform_line(prox_axis,  center_for_motion, dx_screen, dy_screen, ss.theta)
+            if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, dx_screen, dy_screen, ss.theta)
 
     def _draw_line(line: Line, col, label: str):
-        # show first point immediately
         if len(line) >= 1:
             p0 = line[0]
             d.ellipse([p0[0]-4, p0[1]-4, p0[0]+4, p0[1]+4], fill=col)
-        # draw full segment + label when we have two points
         if len(line) == 2:
             d.line(line, fill=col, width=3)
             for p in line:
                 d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=col)
-            # named angle tag at midpoint
+            # line name at midpoint
             mid = ((line[0][0]+line[1][0])/2.0, (line[0][1]+line[1][1])/2.0)
-            a = angle_deg(line[0], line[1])
-            text = f"{label}: {a:.1f}°"
-            # small dark bubble near the line
-            pad = 4
-            tw, th = 8*len(text)*0.6, 16  # rough width estimate (no font metrics)
-            bx0, by0 = mid[0]+6, mid[1]-8
-            bx1, by1 = bx0 + tw + pad*2, by0 + th
-            d.rectangle([bx0,by0,bx1,by1], fill=(0,0,0,160))
-            d.text((bx0+pad, by0+2), text, fill=(255,255,255,230))
+            bubble(d, mid, label)
 
     _draw_line(prox_axis, (66,133,244,255), "prox axis")
     _draw_line(dist_axis, (221,0,221,255), "dist axis")
     _draw_line(prox_joint,(255,215,0,220), "prox joint")
     _draw_line(dist_joint,(255,215,0,220), "dist joint")
+
+    # angle reports (both small & large) at intersections
+    def _angle_pair(name: str, l1: Line, l2: Line, dy_offset: int = 0):
+        ab = angle_between_lines(l1, l2)
+        if not ab: return
+        inter = line_intersection(l1, l2)
+        if not inter:
+            # fallback: midpoint between the two midpoints
+            if len(l1)==2 and len(l2)==2:
+                m1 = ((l1[0][0]+l1[1][0])/2.0, (l1[0][1]+l1[1][1])/2.0)
+                m2 = ((l2[0][0]+l2[1][0])/2.0, (l2[0][1]+l2[1][1])/2.0)
+                inter = ((m1[0]+m2[0])/2.0, (m1[1]+m2[1])/2.0)
+            else:
+                return
+        # small & large
+        small, large = ab
+        bubble(d, (inter[0], inter[1] + dy_offset), f"{name}  small:{small:.1f}°  large:{large:.1f}°")
+
+    # 1) prox joint vs prox axis
+    if len(prox_axis)==2 and len(prox_joint)==2:
+        _angle_pair("prox joint↔axis", prox_joint, prox_axis, dy_offset=-18)
+    # 2) dist joint vs dist axis
+    if len(dist_axis)==2 and len(dist_joint)==2:
+        _angle_pair("dist joint↔axis", dist_joint, dist_axis, dy_offset=-18)
+    # 3) prox axis vs dist axis
+    if len(prox_axis)==2 and len(dist_axis)==2:
+        _angle_pair("prox axis↔dist axis", prox_axis, dist_axis, dy_offset=12)
 
     if ss.hinge:
         x,y = ss.hinge
@@ -271,7 +353,7 @@ if click and "x" in click and "y" in click:
 
 with st.expander("Status / help", expanded=False):
     st.write(f"**Tool**: {ss.tool}  |  Osteotomy closed: {ss.poly_closed}")
-    st.write("First click places a node immediately; second click completes the segment. "
-             "Close the osteotomy by clicking within ~10 px of the first node. "
-             "Rotation slider is ±60° (0.2° step); ΔX/ΔY are ±500 px. "
-             "Use 'Delete selected' to clear only one line.")
+    st.write("Click once to place a node; twice to complete a segment. "
+             "Close the osteotomy by clicking near the first node. "
+             "ΔY slides parallel to the proximal axis; ΔX slides perpendicular to it. "
+             "Angle bubbles show small & large angles for joint↔axis and axis↔axis.")
