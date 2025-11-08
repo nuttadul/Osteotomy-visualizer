@@ -48,16 +48,27 @@ def apply_affine_fragment(moving: Image.Image,
     out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
     return out
 
-def rotate_point(p: Pt, center: Pt, deg: float) -> Pt:
+def rotate_point(p: Tuple[float, float], center: Tuple[float, float], deg: float) -> Tuple[float, float]:
+    """Rotate point p around center by +deg using SCREEN (y-down) coordinates.
+
+    Matches Pillow's rotate(+deg), which is visually CCW on screen.
+    """
     ang = math.radians(deg)
     c, s = math.cos(ang), math.sin(ang)
-    x, y = p[0]-center[0], p[1]-center[1]
-    return (center[0] + x*c - y*s, center[1] + x*s + y*c)
+    cx, cy = center
+    x, y = p[0] - cx, p[1] - cy
+    # y-down rotation matrix (same as used for the image fragment)
+    xr =  x * c + y * s
+    yr = -x * s + y * c
+    return (cx + xr, cy + yr)
 
-def transform_line(line: Line, center: Pt, dx: float, dy: float, theta: float) -> Line:
+def transform_line(line: List[Tuple[float, float]],
+                   center: Tuple[float, float],
+                   dx: float, dy: float, theta: float) -> List[Tuple[float, float]]:
+    """Rotate line around center by +theta (y-down CCW), then translate by (dx, dy)."""
     p0 = rotate_point(line[0], center, theta)
     p1 = rotate_point(line[1], center, theta)
-    return [(p0[0]+dx, p0[1]+dy), (p1[0]+dx, p1[1]+dy)]
+    return [(p0[0] + dx, p0[1] + dy), (p1[0] + dx, p1[1] + dy)]
 
 def safe_width_slider(default_hint: int, uploaded_img: Optional[Image.Image]) -> int:
     """
