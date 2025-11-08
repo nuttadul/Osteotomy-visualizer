@@ -127,7 +127,7 @@ defaults = dict(
 for k,v in defaults.items(): ss.setdefault(k, v)
 
 # ---------------- sidebar ----------------
-st.sidebar.title("Osteotomy visualizer")
+st.sidebar.title("Osteotomy Visualizer")
 st.sidebar.caption("by **Nath Adulkasem, MD, PhD**")
 st.sidebar.caption("Department of Orthopaedic Surgery,\nFaculty of Medicine Siriraj Hospital,\nMahidol University, Thailand")
 
