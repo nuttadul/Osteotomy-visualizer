@@ -197,7 +197,7 @@ if axis_origin_disp is not None:
 
 # --------------------- click handling ---------------------
 # (we capture clicks on the overlay image with visual guides drawn)
-click = streamlit_image_coordinates(overlay, width=dispW, key="click-main")
+click = streamlit_image_coordinates(overlay.convert("RGB"), width=dispW, key="click-main")
 
 if click and "x" in click and "y" in click:
     p_disp = (float(click["x"]), float(click["y"]))
