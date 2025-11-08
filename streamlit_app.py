@@ -181,26 +181,21 @@ if tool in ("CORA","HINGE"):
             if tool == "CORA": ss.cora = pt
             else: ss.hinge = pt
 
-# ---------- LIVE tools (robust canvas) ----------
+# ---------- LIVE tools (robust canvas; PIL background) ----------
 
-import numpy as np
-
-def _to_canvas_rgb_np(pil_img: Image.Image) -> np.ndarray:
-    """Convert PIL image to RGB uint8 numpy array (what the canvas expects)."""
+def _to_canvas_rgb_pil(pil_img: Image.Image) -> Image.Image:
+    """Canvas background as PIL RGB (works across older/newer builds)."""
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
-    arr = np.array(pil_img)
-    if arr.dtype != np.uint8:
-        arr = arr.astype(np.uint8, copy=False)
-    return arr
+    return pil_img
 
 def _canvas_safe_call(**kwargs):
     """
     Call st_canvas with variants that avoid 'blank canvas':
-      A) only background_image (let it infer size)
+      A) only background_image (let the component infer size)
       B) image + explicit width/height
-      C) image + size + white background (some builds need this)
-    Also uses display_ratio=1.0 if supported (prevents DPI drift).
+      C) + white background_color (some builds require it)
+    Also tries display_ratio=1.0 if supported (prevents DPI drift).
     """
     from streamlit_drawable_canvas import st_canvas
 
@@ -210,8 +205,8 @@ def _canvas_safe_call(**kwargs):
         except TypeError:
             return st_canvas(**k)
 
-    bg = kwargs.pop("background_image")
-    H, W = bg.shape[0], bg.shape[1]
+    bg = kwargs.pop("background_image")  # PIL.Image (RGB)
+    W, H = bg.size
 
     # A) image only
     try:
@@ -226,12 +221,13 @@ def _canvas_safe_call(**kwargs):
         pass
 
     # C) add white background color (last resort)
-    return _call(background_image=bg, width=W, height=H, background_color="#ffffff", **kwargs)
+    return _call(background_image=bg, width=W, height=H,
+                 background_color="#ffffff", **kwargs)
 
-def live_polygon(background: Image.Image, existing_pts: list, key: str) -> list:
-    """Draw polygon with live preview; returns list of original-image coords."""
-    bg = _to_canvas_rgb_np(background)
-    # try polygon mode first; fall back to polyline
+def live_polygon(background_pil: Image.Image, existing_pts: list, key: str) -> list:
+    """PowerPoint-style polygon drawing; returns original-image coords."""
+    bg = _to_canvas_rgb_pil(background_pil)
+    # Try polygon; fall back to polyline on older builds
     try:
         result = _canvas_safe_call(
             background_image=bg,
@@ -264,14 +260,14 @@ def live_polygon(background: Image.Image, existing_pts: list, key: str) -> list:
             if t in ("polyline", "path"):
                 pts = _parse_polygon(obj, scale)
                 if len(pts) >= 3 and pts[0] != pts[-1]:
-                    pts.append(pts[0])  # close shape
+                    pts.append(pts[0])  # close
                 if len(pts) >= 3:
                     return pts
     return existing_pts
 
-def live_line(background: Image.Image, current_line: list, color: str, key: str) -> list:
-    """Draw a line with live preview; returns [p0,p1] in original-image coords."""
-    bg = _to_canvas_rgb_np(background)
+def live_line(background_pil: Image.Image, current_line: list, color: str, key: str) -> list:
+    """PowerPoint-style line drawing; returns [p0,p1] in original-image coords."""
+    bg = _to_canvas_rgb_pil(background_pil)
     result = _canvas_safe_call(
         background_image=bg,
         update_streamlit=True,
