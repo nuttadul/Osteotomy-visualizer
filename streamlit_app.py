@@ -134,28 +134,45 @@ st.sidebar.caption("Department of Orthopaedic Surgery,\nFaculty of Medicine Siri
 st.sidebar.header("Load image")
 up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
 
-# Manual button
-if st.sidebar.button("How to use (step-by-step)"):
-    ss.show_manual = not ss.show_manual
 
-if ss.show_manual:
-    st.sidebar.info(
-        "1) **Upload image**.\n"
-        "2) **Prox joint**: draw the proximal joint tangent line (two clicks).\n"
-        "3) **Prox axis**: draw the proximal mechanical/shaft axis.\n"
-        "4) **Dist joint**: draw the distal joint tangent.\n"
-        "5) **Dist axis**: draw the distal axis.\n"
-        "6) **Osteotomy**: click to add nodes; click near the first node to close.\n"
-        "7) **HINGE/CORA**: click to set rotation center (else centroid is used).\n"
-        "8) Use **ΔX/ΔY/Rotate** to move the chosen segment; the corresponding axes/joint lines move with it.\n"
-        "Tip: click the **Delete selected** control to clear just one line."
-    )
+# Desired display names & order
+TOOL_LABELS = [
+    "Proximal joint orientation line",
+    "Proximal axis",
+    "Distal joint orientation line",
+    "Distal axis",
+    "Osteotomy polygon",
+    "HINGE",
+    "CORA",
+]
+# Map display label -> internal name that logic understands
+MAP_TO_INTERNAL = {
+    "Proximal joint orientation line": "Prox joint",
+    "Proximal axis": "Prox axis",
+    "Distal joint orientation line": "Dist joint",
+    "Distal axis": "Dist axis",
+    "Osteotomy polygon": "Osteotomy",
+    "HINGE": "HINGE",
+    "CORA": "CORA",
+}
+# Map display label -> internal name that logic understands
+MAP_TO_INTERNAL = {
+    "Proximal joint orientation line": "Prox joint",
+    "Proximal axis": "Prox axis",
+    "Distal joint orientation line": "Dist joint",
+    "Distal axis": "Dist axis",
+    "Osteotomy polygon": "Osteotomy",
+    "HINGE": "HINGE",
+    "CORA": "CORA",
+}
+# Pick index based on previous internal tool
+internal_to_display = {v:k for k,v in MAP_TO_INTERNAL.items()}
+default_display = internal_to_display.get(ss.tool, "Osteotomy polygon")
+display_index = TOOL_LABELS.index(default_display)
 
-ss.tool = st.sidebar.radio(
-    "Tool",
-    ["Osteotomy","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"],
-    index=["Osteotomy","Prox axis","Dist axis","Prox joint","Dist joint","HINGE","CORA"].index(ss.tool),
-)
+display_choice = st.sidebar.radio("Tool", TOOL_LABELS, index=display_index)
+tool = MAP_TO_INTERNAL[display_choice]
+ss.tool = tool  # store internal
 
 st.sidebar.markdown("**Delete a single item**")
 del_choice = st.sidebar.selectbox("(select to clear one)",
@@ -338,8 +355,38 @@ if click and "x" in click and "y" in click:
         ss.cora=p
     st.rerun()
 
-with st.expander("Status / help", expanded=False):
-    st.write(f"**Tool**: {ss.tool}  |  Osteotomy closed: {ss.poly_closed}")
-    st.write("Click once to place a node; the line appears after the 2nd click. "
-             "Click near the first node to close the osteotomy. ΔY slides ∥ prox axis; ΔX slides ⟂ prox axis. "
-             "At every intersection, four angle bubbles are placed inside the actual sectors.")
+
+# -------------------- User Guide (collapsible) -------------------
+with st.expander("User Guide", expanded=False):
+    st.markdown("""
+**Interaction model:** This is a **click-based** app.  
+- **Lines:** click once for the first endpoint, click again for the second endpoint.  
+- **Polygon:** click to add each corner (node). Click close to the **first** node to close the loop.
+
+### 1) Upload the radiograph
+Upload your bone image (e.g., long-leg X-ray). The image becomes the drawing surface.
+
+### 2) Define joint orientation and axes (proximal first, then distal)
+**A. Proximal joint orientation line** — draw a tangent along the proximal articular surface.  
+**B. Proximal axis** — draw a line **normal to the corresponding joint orientation angle**.  
+This represents the **mechanical/anatomical axis of the proximal segment**.  
+**C. Distal joint orientation line** — draw a tangent along the distal articular surface.  
+**D. Distal axis** — draw a line **normal to the corresponding joint orientation angle**.  
+This represents the **mechanical/anatomical axis of the distal segment**.
+
+### 3) Mark CORA and Hinge
+**CORA** — click at the intersection of proximal and distal axes (deformity apex).  
+**HINGE** — click to place the rotation center during simulation.
+
+### 4) Draw the osteotomy
+Choose **Osteotomy polygon**. Click to add each corner.  
+Close the shape by clicking close to the first node.
+
+### 5) Simulate the correction
+Select which fragment moves (**Distal** or **Proximal**).  
+Use sliders for translation (ΔX = ⟂ to proximal axis, ΔY = ∥ to proximal axis) and rotation (θ).
+
+### 6) Editing & Reset
+Use the **Delete selected item** dropdown to clear a single line.  
+Reset buttons clear polygons, axes, joints, or points as needed.
+""")
