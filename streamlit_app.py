@@ -12,7 +12,8 @@ Line = List[Pt]
 
 # ---------- tiny utils ----------
 def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()
+    import hashlib as _h
+    return _h.sha1(b).hexdigest()
 
 def load_rgba(b: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(b))
@@ -83,16 +84,12 @@ def line_intersection(l1: Line, l2: Line) -> Optional[Pt]:
     return (px,py)
 
 def angle_bisectors(l1: Line, l2: Line) -> Optional[Tuple[Pt, Pt]]:
-    """
-    Return unit vectors for the small-angle bisector and the opposite (large-angle) bisector
-    in screen (y-down) coords, oriented from the intersection point.
-    """
+    """Return unit vectors for the small-angle bisector and the opposite (large) bisector (y-down)."""
     if len(l1)!=2 or len(l2)!=2: return None
     v1=_unit(_vec(l1[0],l1[1])); v2=_unit(_vec(l2[0],l2[1]))
     if _norm(v1)==0 or _norm(v2)==0: return None
-    # small-angle bisector ~ normalize(v1 + v2); if near zero (opposite), try v1 - v2
     cand = (v1[0]+v2[0], v1[1]+v2[1])
-    if _norm(cand) < 1e-6:
+    if _norm(cand) < 1e-6:  # nearly opposite
         cand = (v1[0]-v2[0], v1[1]-v2[1])
     b_small = _unit(cand)
     b_large = (-b_small[0], -b_small[1])
@@ -100,7 +97,7 @@ def angle_bisectors(l1: Line, l2: Line) -> Optional[Tuple[Pt, Pt]]:
 
 def bubble(d: ImageDraw.ImageDraw, anchor: Pt, text: str):
     pad=4
-    tw=max(40,int(8*max(1,len(text))*0.55)); th=16
+    tw=max(34,int(8*max(1,len(text))*0.55)); th=16
     bx0,by0=anchor[0]+8,anchor[1]-8; bx1,by1=bx0+tw+pad*2,by0+th
     d.rectangle([bx0,by0,bx1,by1], fill=(0,0,0,170))
     d.text((bx0+pad, by0+2), text, fill=(255,255,255,230))
@@ -137,7 +134,8 @@ for k,v in defaults.items(): ss.setdefault(k, v)
 
 # ---------------- sidebar ----------------
 st.sidebar.title("Osteotomy visualizer")
-st.sidebar.caption("by **Nath Adulkasem, MD, PhD**")  # <-- credit line
+st.sidebar.caption("by **Nath Adulkasem, MD, PhD**")
+st.sidebar.caption("Department of Orthopaedic Surgery\nFaculty of Medicine Siriraj Hospital\nMahidol University")
 
 st.sidebar.header("Load image")
 up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
@@ -171,7 +169,7 @@ probe_img = load_rgba(up.getvalue()) if up else None
 ss.dispw = safe_width_slider(ss.dispw, probe_img)
 
 st.sidebar.markdown("---")
-# tightened ranges per your request
+# tightened ranges
 ss.dx    = st.sidebar.slider("ΔX (⟂ prox axis)  px", -200, 200, ss.dx, 1)
 ss.dy    = st.sidebar.slider("ΔY (∥ prox axis) px", -200, 200, ss.dy, 1)
 ss.theta = st.sidebar.slider("Rotate (°)", -60.0, 60.0, float(ss.theta), 0.2)
@@ -224,47 +222,65 @@ def overlay_img() -> Image.Image:
             if len(prox_axis)==2:  prox_axis  = transform_line(prox_axis,  center_for_motion, dx_screen, dy_screen, ss.theta)
             if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, dx_screen, dy_screen, ss.theta)
 
-    def _draw_line(line: Line, col, label: str):
+    def _draw_line(line: Line, col):
         if len(line)>=1:
             p0=line[0]; d.ellipse([p0[0]-4,p0[1]-4,p0[0]+4,p0[1]+4], fill=col)
         if len(line)==2:
             d.line(line, fill=col, width=3)
             for p in line: d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=col)
-            mid=((line[0][0]+line[1][0])/2.0,(line[0][1]+line[1][1])/2.0)
-            bubble(d, mid, label)
 
-    _draw_line(prox_axis,(66,133,244,255),"prox axis")
-    _draw_line(dist_axis,(221,0,221,255),"dist axis")
-    _draw_line(prox_joint,(255,215,0,220),"prox joint")
-    _draw_line(dist_joint,(255,215,0,220),"dist joint")
+    _draw_line(prox_axis,(66,133,244,255))
+    _draw_line(dist_axis,(221,0,221,255))
+    _draw_line(prox_joint,(255,215,0,220))
+    _draw_line(dist_joint,(255,215,0,220))
 
-    # angle readouts as two *separate* bubbles placed along bisectors
-    def _two_bubbles(name: str, l1: Line, l2: Line):
+    # --- Angle bubbles placed WHERE the angle lives ---
+    def _two_bubbles_directed(l1: Line, l2: Line, force_region: Optional[str]=None):
+        """
+        Render two bubbles: α (small) along small-angle bisector, β (large) along opposite bisector.
+        If force_region == "below": flip each bisector to have +Y.
+        If force_region == "above": flip each bisector to have −Y.
+        """
         if len(l1)!=2 or len(l2)!=2: return
         inter = line_intersection(l1, l2)
         if not inter:
-            # fallback to midpoint between midpoints
             m1=((l1[0][0]+l1[1][0])/2.0,(l1[0][1]+l1[1][1])/2.0)
             m2=((l2[0][0]+l2[1][0])/2.0,(l2[0][1]+l2[1][1])/2.0)
             inter=((m1[0]+m2[0])/2.0,(m1[1]+m2[1])/2.0)
         ab = angle_between_lines(l1, l2)
         bis = angle_bisectors(l1, l2)
-        if not ab or not bis: return
+        if not ab or not bis or not inter: return
         small, large = ab
         b_small, b_large = bis
-        # place α and β along their respective bisectors
-        r1, r2 = 28, 52  # offsets
+
+        def _orient(v: Pt) -> Pt:
+            if force_region == "below" and v[1] < 0:  # y-down: below => +Y
+                return (-v[0], -v[1])
+            if force_region == "above" and v[1] > 0:  # above => -Y
+                return (-v[0], -v[1])
+            return v
+
+        b_small = _orient(b_small)
+        b_large = _orient(b_large)
+
+        # place α closer, β farther, so they don't overlap
+        r1, r2 = 26, 48
         p_small = (inter[0] + b_small[0]*r1, inter[1] + b_small[1]*r1)
         p_large = (inter[0] + b_large[0]*r2, inter[1] + b_large[1]*r2)
-        bubble(d, p_small, f"{name}  α={small:.1f}°")
-        bubble(d, p_large, f"{name}  β={large:.1f}°")
+        bubble(d, p_small, f"{small:.1f}°")
+        bubble(d, p_large, f"{large:.1f}°")
 
-    # 1) prox joint vs prox axis
-    if len(prox_axis)==2 and len(prox_joint)==2: _two_bubbles("prox joint↔axis", prox_joint, prox_axis)
-    # 2) dist joint vs dist axis
-    if len(dist_axis)==2 and len(dist_joint)==2: _two_bubbles("dist joint↔axis", dist_joint, dist_axis)
-    # 3) prox axis vs dist axis
-    if len(prox_axis)==2 and len(dist_axis)==2:  _two_bubbles("prox axis↔dist axis", prox_axis, dist_axis)
+    # Proximal joint angles: bubbles BELOW the joint line
+    if len(prox_axis)==2 and len(prox_joint)==2:
+        _two_bubbles_directed(prox_joint, prox_axis, force_region="below")
+
+    # Distal joint angles: bubbles ABOVE the joint line
+    if len(dist_axis)==2 and len(dist_joint)==2:
+        _two_bubbles_directed(dist_joint, dist_axis, force_region="above")
+
+    # Axis–Axis angles: no label, place around intersection
+    if len(prox_axis)==2 and len(dist_axis)==2:
+        _two_bubbles_directed(prox_axis, dist_axis, force_region=None)
 
     if ss.hinge:
         x,y=ss.hinge
@@ -317,4 +333,5 @@ with st.expander("Status / help", expanded=False):
     st.write(f"**Tool**: {ss.tool}  |  Osteotomy closed: {ss.poly_closed}")
     st.write("Click once to place a node; the line appears after the 2nd click. "
              "Click near the first node to close the osteotomy.  ΔY slides ∥ prox axis; ΔX slides ⟂ prox axis. "
-             "Angle labels show α (small) and β (large) positioned along the corresponding bisectors.")
+             "Angle bubbles show the two complementary angles at their actual locations. "
+             "Prox-joint angles appear **below** the joint line; Dist-joint angles appear **above** the joint line.")
