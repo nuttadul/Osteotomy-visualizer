@@ -141,14 +141,18 @@ def parse_polygon(obj, scale):
 
 def safe_st_canvas(**kwargs):
     """
-    Robust call to st_canvas:
-      - try with display_ratio=1.0
-      - pass width/height + background_color as needed
-    This prevents 'blank' canvas on some hosts.
+    Robust call to st_canvas across different package builds:
+      1) try PIL.Image background
+      2) try NumPy array background
+      3) try explicit width/height + white background_color
+    Also prefers display_ratio=1.0 to avoid DPI drift.
     """
-    bg = kwargs.pop("background_image")
+    from streamlit_drawable_canvas import st_canvas
+    bg = kwargs.pop("background_image")          # PIL.Image
+    if bg.mode != "RGB":
+        bg = bg.convert("RGB")
     W, H = bg.size
-    bg_np = pil_to_np_rgb(bg)
+    bg_np = np.array(bg)
 
     def _call(**k):
         try:
@@ -156,21 +160,25 @@ def safe_st_canvas(**kwargs):
         except TypeError:
             return st_canvas(**k)
 
-    # A: simplest
+    # A) PIL image (some builds accept PIL directly)
+    try:
+        return _call(background_image=bg, **kwargs)
+    except Exception:
+        pass
+
+    # B) NumPy image (other builds require np.ndarray)
     try:
         return _call(background_image=bg_np, **kwargs)
     except Exception:
         pass
 
-    # B: explicit size
-    try:
-        return _call(background_image=bg_np, width=W, height=H, **kwargs)
-    except Exception:
-        pass
-
-    # C: explicit size + bg color
-    return _call(background_image=bg_np, width=W, height=H,
-                 background_color="#ffffff", **kwargs)
+    # C) explicit size + white background (last resort)
+    return _call(
+        background_image=bg_np,
+        width=W, height=H,
+        background_color="#ffffff",
+        **kwargs,
+    )
 
 # ============================ state ============================
 
