@@ -1,153 +1,213 @@
-# app.py — SAFE MODE (no third-party canvas required) + optional experimental canvas
-import io, base64
+# app.py — Bone Ninja–style Osteotomy Planner
+import io, math, base64
 from typing import List, Tuple
+import numpy as np
+import pandas as pd
 from PIL import Image, ImageOps, ImageDraw
 import streamlit as st
+from streamlit_drawable_canvas import st_canvas
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Osteotomy – Safe Mode", layout="wide")
+st.set_page_config(page_title="Bone Ninja-style Osteotomy", layout="wide")
 
-# ---------------- helpers ----------------
+# ---------------- Utilities ----------------
 def load_rgba(b: bytes) -> Image.Image:
     im = Image.open(io.BytesIO(b))
     return ImageOps.exif_transpose(im).convert("RGBA")
 
-def draw_overlay(base_rgba: Image.Image, state) -> Image.Image:
-    out = base_rgba.copy()
-    d = ImageDraw.Draw(out, "RGBA")
-    # polygon
-    if len(state["poly"]) >= 2:
-        pts = [o2c(p, state["scale"]) for p in state["poly"]]
-        if len(pts) >= 3 and not state["poly_open"]:
-            d.polygon(pts, outline=(0,255,255,255), fill=(0,255,255,40))
-        else:
-            d.line(pts, fill=(0,255,255,255), width=2)
-    # lines
-    if len(state["prox"]) == 2:
-        d.line([o2c(state["prox"][0], state["scale"]), o2c(state["prox"][1], state["scale"])],
-               fill=(66,133,244,255), width=3)
-    if len(state["dist"]) == 2:
-        d.line([o2c(state["dist"][0], state["scale"]), o2c(state["dist"][1], state["scale"])],
-               fill=(221,0,221,255), width=3)
-    # points
-    if state["cora"]:
-        x,y = o2c(state["cora"], state["scale"]); d.ellipse([x-5,y-5,x+5,y+5], outline=(0,200,0,255), width=2)
-    if state["hinge"]:
-        x,y = o2c(state["hinge"], state["scale"])
-        d.ellipse([x-6,y-6,x+6,y+6], outline=(255,165,0,255), width=3)
-        d.line([(x-12,y),(x+12,y)], fill=(255,165,0,255), width=1)
-        d.line([(x,y-12),(x,y+12)], fill=(255,165,0,255), width=1)
-    return out
+def c2o(pt, scale): return (pt[0]/scale, pt[1]/scale)
+def o2c(pt, scale): return (pt[0]*scale, pt[1]*scale)
 
-def c2o(pt, scale):  # canvas(pixel) -> original(pixel)
-    return (pt[0] / scale, pt[1] / scale)
+def vec_angle(v1, v2):
+    a1 = math.atan2(v1[1], v1[0])
+    a2 = math.atan2(v2[1], v2[0])
+    deg = math.degrees(abs(a1 - a2))
+    return min(deg, 180 - deg if deg > 180 else deg)
 
-def o2c(pt, scale):  # original(pixel) -> canvas(pixel)
-    return (pt[0] * scale, pt[1] * scale)
+def safe_canvas(bg_img, drawing_mode, stroke_color, stroke_width, key, width, height):
+    try:
+        return st_canvas(
+            background_image=bg_img,
+            display_ratio=1.0,
+            fill_color="rgba(0,0,0,0)",
+            background_color=None,
+            stroke_color=stroke_color,
+            stroke_width=stroke_width,
+            width=width,
+            height=height,
+            update_streamlit=True,
+            key=key,
+            display_toolbar=True,
+        )
+    except Exception:
+        return st_canvas(
+            background_image=np.array(bg_img.convert("RGB")),
+            stroke_color=stroke_color,
+            stroke_width=stroke_width,
+            width=width,
+            height=height,
+            update_streamlit=True,
+            key=key,
+            display_toolbar=True,
+        )
 
-def close_enough(a, b, px):  # squared distance check
-    dx = a[0]-b[0]; dy = a[1]-b[1]
-    return dx*dx + dy*dy <= px*px
+def parse_line(obj):
+    return [(float(obj.get("x1",0)), float(obj.get("y1",0))),
+            (float(obj.get("x2",0)), float(obj.get("y2",0)))]
 
-# ---------------- state ----------------
+def parse_poly(obj):
+    if "points" in obj:
+        left=obj.get("left",0); top=obj.get("top",0)
+        sx=obj.get("scaleX",1); sy=obj.get("scaleY",1)
+        pts=[(left+sx*p["x"], top+sy*p["y"]) for p in obj["points"]]
+        return pts
+    if "path" in obj:
+        pts=[]
+        for cmd in obj["path"]:
+            if isinstance(cmd,list) and len(cmd)>=3 and cmd[0] in ("M","L"):
+                pts.append((cmd[1],cmd[2]))
+        return pts
+    return []
+
+# ---------------- State ----------------
 ss = st.session_state
 defaults = dict(
-    tool="Polygon",
-    preview_w=1100,
-    snap_px=12,
-    poly=[], poly_open=True,
-    prox=[], dist=[],
+    tool="Joint line",
+    poly=[], joint=[], axis=[], prox=[], dist=[],
     cora=None, hinge=None,
-    use_canvas=False,   # experimental (off by default)
+    angle_input=81.0,
+    poly_open=True,
+    move_seg="distal",
+    dx=0, dy=0, rot=0,
+    preview_w=1100,
     nonce=0
 )
-for k,v in defaults.items():
-    ss.setdefault(k,v)
+for k,v in defaults.items(): ss.setdefault(k,v)
 
-# ---------------- sidebar ----------------
-st.sidebar.header("Upload image")
+# ---------------- Sidebar ----------------
+st.sidebar.header("Upload X-ray")
 up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
-
-ss.tool        = st.sidebar.radio("Tool", ["Polygon","Prox line","Dist line","CORA","HINGE"], index=0)
-ss.preview_w   = st.sidebar.slider("Preview width", 600, 1800, ss.preview_w, 50)
-ss.snap_px     = st.sidebar.slider("Polygon snap distance (px)", 4, 20, int(ss.snap_px), 1)
-ss.use_canvas  = st.sidebar.toggle("Experimental live canvas (may be unstable)", value=ss.use_canvas)
-
-c1,c2,c3,c4,c5 = st.sidebar.columns(5)
-if c1.button("Undo"):
-    if ss.tool == "Polygon" and ss.poly:
-        ss.poly.pop()
-    elif ss.tool == "Prox line" and ss.prox:
-        ss.prox.pop()
-    elif ss.tool == "Dist line" and ss.dist:
-        ss.dist.pop()
-if c2.button("Finish poly"):
-    if len(ss.poly) >= 3:
-        ss.poly_open = False
-if c3.button("Reset poly"):   ss.poly.clear(); ss.poly_open=True
-if c4.button("Reset lines"):  ss.prox.clear(); ss.dist.clear()
-if c5.button("Clear points"): ss.cora=None; ss.hinge=None
-
 if not up:
-    st.info("Upload an image to begin.")
+    st.info("Upload an X-ray to begin.")
     st.stop()
 
-# ---------------- sizing ----------------
+ss.tool = st.sidebar.radio("Tool", 
+    ["Joint line","Axis line (auto)","Prox line","Dist line","Polygon cut","CORA","HINGE"], index=0)
+ss.angle_input = st.sidebar.number_input("Joint orientation angle (°)", 40.0, 140.0, ss.angle_input, 0.5)
+ss.move_seg = st.sidebar.radio("Move segment", ["distal","proximal"], index=(0 if ss.move_seg=="distal" else 1))
+ss.dx   = st.sidebar.slider("ΔX (px)", -400, 400, ss.dx, 1)
+ss.dy   = st.sidebar.slider("ΔY (px)", -400, 400, ss.dy, 1)
+ss.rot  = st.sidebar.slider("Rotate (°)", -90, 90, ss.rot, 1)
+if st.sidebar.button("Reset move"): ss.dx=ss.dy=ss.rot=0
+st.sidebar.divider()
+if st.sidebar.button("Reset all"):
+    for k in ("poly","joint","axis","prox","dist"): ss[k]=[]
+    ss.cora=ss.hinge=None; ss.nonce+=1; st.experimental_rerun()
+
+# ---------------- Image sizing ----------------
 img = load_rgba(up.getvalue())
-origW, origH = img.size
-cw = min(ss.preview_w, origW)
-scale = cw / float(origW)
-ch = int(round(origH * scale))
-disp = img.resize((cw, ch), Image.NEAREST)
+W,H = img.size
+scale = min(ss.preview_w/W, 1.0)
+cw,ch = int(W*scale), int(H*scale)
+disp_img = img.resize((cw,ch), Image.NEAREST)
 
-state = dict(scale=scale, poly=ss.poly, poly_open=ss.poly_open,
-             prox=ss.prox, dist=ss.dist, cora=ss.cora, hinge=ss.hinge)
+# ---------------- Layout ----------------
+left,right = st.columns([1.1,1])
+left.subheader("Live Drawing")
+right.subheader("Preview / Simulation")
 
-left, right = st.columns([1.05,1])
-
-# ---------------- LEFT: interactive input ----------------
-left.subheader("Input")
-if ss.use_canvas:
-    # optional: try canvas (image always shown as plain background in left panel)
-    st.caption("Experimental canvas disabled in Safe Mode build — use the click workflow below.")
-    # (Intentionally not calling the 3rd-party canvas here to avoid the crash loop)
+# ---------------- Drawing ----------------
+tool=ss.tool
+if tool in ("Joint line","Prox line","Dist line","Polygon cut"):
+    mode="line" if tool!="Polygon cut" else "polyline"
 else:
-    # click-to-place workflow (robust)
-    # 1) show current overlay image and capture one click
-    live = draw_overlay(disp, state)
-    res = left.image(live, use_column_width=False)
-    click = streamlit_image_coordinates(live, width=cw, key=f"clicks-{ss.nonce}")
+    mode="transform"
+col="#00FFFF" if tool=="Polygon cut" else "#4285F4"
+result = safe_canvas(
+    disp_img, mode, col, 3,
+    key=f"canvas-{ss.nonce}-{tool}", width=cw, height=ch
+)
 
-    if click and "x" in click and "y" in click:
-        pt_c = (float(click["x"]), float(click["y"]))
-        pt_o = c2o(pt_c, scale)
+if result.json_data:
+    objs=result.json_data.get("objects",[])
+    for obj in reversed(objs):
+        t=obj.get("type","")
+        if t=="image": continue
+        if tool=="Joint line" and t=="line":
+            ss.joint=[c2o(p,scale) for p in parse_line(obj)]
+            # auto axis creation
+            if len(ss.joint)==2:
+                (x1,y1),(x2,y2)=ss.joint
+                vx,vy=x2-x1,y2-y1
+                ang=math.atan2(vy,vx)-math.radians(90-ss.angle_input)
+                L=200
+                ax=(x2+L*math.cos(ang), y2+L*math.sin(ang))
+                ss.axis=[(x2,y2),ax]
+            break
+        if tool=="Polygon cut" and t in ("polyline","path"):
+            pts=parse_poly(obj)
+            if len(pts)>=3:
+                # auto-close
+                if ((pts[0][0]-pts[-1][0])**2+(pts[0][1]-pts[-1][1])**2)**0.5<12:
+                    pts[-1]=pts[0]
+                ss.poly=[c2o(p,scale) for p in pts]
+            break
+        if tool=="Prox line" and t=="line": ss.prox=[c2o(p,scale) for p in parse_line(obj)]; break
+        if tool=="Dist line" and t=="line": ss.dist=[c2o(p,scale) for p in parse_line(obj)]; break
 
-        if ss.tool == "Polygon":
-            if ss.poly_open:
-                if len(ss.poly) >= 2 and close_enough(o2c(ss.poly[0], scale), pt_c, ss.snap_px):
-                    # auto-close
-                    ss.poly_open = False
-                else:
-                    ss.poly.append(pt_o)
-        elif ss.tool == "Prox line":
-            ss.prox.append(pt_o)
-            if len(ss.prox) > 2: ss.prox = ss.prox[-2:]
-        elif ss.tool == "Dist line":
-            ss.dist.append(pt_o)
-            if len(ss.dist) > 2: ss.dist = ss.dist[-2:]
-        elif ss.tool == "CORA":
-            ss.cora = pt_o
-        elif ss.tool == "HINGE":
-            ss.hinge = pt_o
-        ss.nonce += 1
-        st.rerun()
+# ---------------- CORA / HINGE click ----------------
+if tool in ("CORA","HINGE"):
+    res = streamlit_image_coordinates(disp_img, width=cw, key=f"clicks-{ss.nonce}")
+    if res and "x" in res:
+        pt=(res["x"]/scale,res["y"]/scale)
+        if tool=="CORA": ss.cora=pt
+        else: ss.hinge=pt
+        ss.nonce+=1; st.experimental_rerun()
 
-# ---------------- RIGHT: preview (always aligned, always shows background) ----------------
-right.subheader("Preview")
-final_overlay = draw_overlay(disp, dict(
-    scale=scale, poly=ss.poly, poly_open=ss.poly_open,
-    prox=ss.prox, dist=ss.dist, cora=ss.cora, hinge=ss.hinge
-))
-right.image(final_overlay, use_column_width=False)
+# ---------------- Simulation ----------------
+preview = disp_img.copy()
+draw = ImageDraw.Draw(preview,"RGBA")
 
-st.caption("Safe Mode: reliable online. Turn on 'Experimental live canvas' later if you need drag-lines and your host supports it.")
+def draw_line(l,color):
+    if len(l)==2: draw.line([o2c(l[0],scale),o2c(l[1],scale)],fill=color,width=3)
+draw_line(ss.joint,(0,200,200,255))
+draw_line(ss.axis,(255,200,0,255))
+draw_line(ss.prox,(66,133,244,255))
+draw_line(ss.dist,(221,0,221,255))
+if ss.cora:
+    x,y=o2c(ss.cora,scale); draw.ellipse([x-5,y-5,x+5,y+5],outline=(0,255,0,255),width=2)
+if ss.hinge:
+    x,y=o2c(ss.hinge,scale)
+    draw.ellipse([x-6,y-6,x+6,y+6],outline=(255,165,0,255),width=3)
+    draw.line([(x-12,y),(x+12,y)],fill=(255,165,0,255),width=1)
+    draw.line([(x,y-12),(x,y+12)],fill=(255,165,0,255),width=1)
+
+# polygon cut & movement
+if len(ss.poly)>=3:
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).polygon(ss.poly, fill=255)
+    inv = ImageOps.invert(mask)
+    prox_img=Image.new("RGBA",img.size,(0,0,0,0));prox_img.paste(img,(0,0),inv)
+    dist_img=Image.new("RGBA",img.size,(0,0,0,0));dist_img.paste(img,(0,0),mask)
+    center = ss.hinge or ss.cora or ss.poly[0]
+    def transform(im):
+        rot=im.rotate(ss.rot, center=center, resample=Image.BICUBIC)
+        out=Image.new("RGBA",im.size,(0,0,0,0))
+        out.alpha_composite(rot,(int(ss.dx),int(ss.dy)))
+        return out
+    moving = dist_img if ss.move_seg=="distal" else prox_img
+    fixed  = prox_img if ss.move_seg=="distal" else dist_img
+    moved = transform(moving)
+    merged=Image.alpha_composite(fixed,moved)
+    preview=merged.resize((cw,ch),Image.NEAREST)
+    draw=ImageDraw.Draw(preview,"RGBA")
+    # redraw polygon
+    pts_c=[o2c(p,scale) for p in ss.poly]
+    draw.polygon(pts_c,outline=(0,255,255,255),fill=(0,255,255,40))
+
+# ---------------- Output ----------------
+right.image(preview,width=cw)
+if len(ss.joint)==2 and len(ss.axis)==2:
+    v1=np.array([ss.joint[1][0]-ss.joint[0][0], ss.joint[1][1]-ss.joint[0][1]])
+    v2=np.array([ss.axis[1][0]-ss.axis[0][0], ss.axis[1][1]-ss.axis[0][1]])
+    st.caption(f"Measured angle between joint & axis: {vec_angle(v1,v2):.1f}°")
