@@ -188,11 +188,18 @@ def overlay_img() -> Image.Image:
             if len(prox_axis)==2:  prox_axis  = transform_line(prox_axis,  center_for_motion, ss.dx, ss.dy, ss.theta)
             if len(prox_joint)==2: prox_joint = transform_line(prox_joint, center_for_motion, ss.dx, ss.dy, ss.theta)
 
-    def _draw_line(line: Line, col):
-        if len(line)==2:
-            d.line(line, fill=col, width=3)
-            for p in line:
-                d.ellipse([p[0]-4,p[1]-4,p[0]+4,p[1]+4], fill=col)
+# inside overlay_img()
+def _draw_line(line: Line, col):
+    # Show first point immediately (snappy feedback)
+    if len(line) >= 1:
+        p0 = line[0]
+        d.ellipse([p0[0]-4, p0[1]-4, p0[0]+4, p0[1]+4], fill=col)
+
+    # When both endpoints exist, draw the line + both endpoints
+    if len(line) == 2:
+        d.line(line, fill=col, width=3)
+        for p in line:
+            d.ellipse([p[0]-4, p[1]-4, p[0]+4, p[1]+4], fill=col)
 
     _draw_line(prox_axis, (66,133,244,255))
     _draw_line(dist_axis, (221,0,221,255))
