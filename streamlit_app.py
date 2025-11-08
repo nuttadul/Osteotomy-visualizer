@@ -1,260 +1,376 @@
-# app.py — Angle-assisted axes with joint line (tangent or freehand), axis origin choice, and ghost line
+# app.py
+# -------------------------------
+# Osteotomy visualizer (click-based, no canvas)
+# - Upload an X-ray
+# - Draw joints, axes (with optional angle assist + ghost line)
+# - Draw polygon and set hinge
+# - Simulate distal/proximal movement around hinge
+# -------------------------------
+
 import io, math
 from typing import List, Tuple, Optional
+
 import numpy as np
 from PIL import Image, ImageOps, ImageDraw
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Angle-assisted Axes (Bone-Ninja style)", layout="wide")
 
-# --------------------- helpers ---------------------
+# -------------------------------
+# Streamlit setup
+# -------------------------------
+st.set_page_config(
+    page_title="Osteotomy Visualizer (click-based)",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <style>
+    /* nicer radio spacing */
+    div[role="radiogroup"] > label { margin-right: .75rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# -------------------------------
+# Helpers
+# -------------------------------
 def load_rgba(file_bytes: bytes) -> Image.Image:
-    im = Image.open(io.BytesIO(file_bytes))
-    return ImageOps.exif_transpose(im).convert("RGBA")
+    """Load image, honor EXIF orientation, RGBA mode."""
+    img = Image.open(io.BytesIO(file_bytes))
+    return ImageOps.exif_transpose(img).convert("RGBA")
 
-def line_angle(p0, p1) -> float:
-    """Angle (radians) of vector p0->p1 in screen coords (y down)."""
-    return math.atan2(p1[1]-p0[1], p1[0]-p0[0])
 
-def extend_inf_line_through_image(p0, p1, w, h) -> Tuple[Tuple[float,float], Tuple[float,float]]:
-    """Return endpoints where infinite line through p0-p1 intersects image bounds."""
-    x0,y0 = p0; x1,y1 = p1
-    dx, dy = x1-x0, y1-y0
-    eps = 1e-9
-    if abs(dx) < eps and abs(dy) < eps:
-        return p0, p1
-    ts = []
-    # Intersections with x=0 and x=w
-    if abs(dx) > eps:
-        t = (0 - x0)/dx; y = y0 + t*dy
-        if 0 <= y <= h: ts.append(t)
-        t = (w - x0)/dx; y = y0 + t*dy
-        if 0 <= y <= h: ts.append(t)
-    # Intersections with y=0 and y=h
-    if abs(dy) > eps:
-        t = (0 - y0)/dy; x = x0 + t*dx
-        if 0 <= x <= w: ts.append(t)
-        t = (h - y0)/dy; x = x0 + t*dx
-        if 0 <= x <= w: ts.append(t)
-    if len(ts) < 2:
-        return p0, p1
-    t0, t1 = min(ts), max(ts)
-    a = (x0 + t0*dx, y0 + t0*dy)
-    b = (x0 + t1*dx, y0 + t1*dy)
-    return a, b
+def polygon_mask(size: Tuple[int, int], pts: List[Tuple[float, float]]) -> Image.Image:
+    """Create 8-bit mask (L) with a filled polygon."""
+    m = Image.new("L", size, 0)
+    if len(pts) >= 3:
+        ImageDraw.Draw(m).polygon(pts, fill=255, outline=255)
+    return m
 
-def draw_grid(img: Image.Image, step: int = 50, alpha: int = 40) -> Image.Image:
-    im = img.copy()
-    d = ImageDraw.Draw(im, "RGBA")
-    w, h = im.size
-    col = (255,255,255,alpha)
-    for x in range(0, w, step):
-        d.line([(x,0),(x,h)], fill=col, width=1)
-    for y in range(0, h, step):
-        d.line([(0,y),(w,y)], fill=col, width=1)
-    return im
 
-def draw_crosshair(im: Image.Image, p: Tuple[float,float], size=18, alpha=130):
-    d = ImageDraw.Draw(im, "RGBA")
-    x,y = p
-    col = (255,255,0,alpha)
-    d.line([(x-size,y),(x+size,y)], fill=col, width=1)
-    d.line([(x,y-size),(x,y+size)], fill=col, width=1)
+def rotate_about(pt: Tuple[float, float], center: Tuple[float, float], deg: float) -> Tuple[float, float]:
+    """Rotate a point about center in screen coords (y-down)."""
+    x, y = pt
+    cx, cy = center
+    ang = math.radians(deg)
+    c, s = math.cos(ang), math.sin(ang)
+    # Screen coords: positive rotation is CCW visually
+    x0, y0 = x - cx, y - cy
+    xr = x0 * c + y0 * s
+    yr = -x0 * s + y0 * c
+    return (xr + cx, yr + cy)
 
-def to_disp(p, scale, zoom): return (p[0]*scale*zoom, p[1]*scale*zoom)
-def to_orig(p, scale, zoom): return (p[0]/(scale*zoom), p[1]/(scale*zoom))
 
-# --------------------- state ---------------------
+def apply_osteotomy(
+    src_rgba: Image.Image,
+    poly_pts: List[Tuple[float, float]],
+    hinge: Tuple[float, float],
+    dx: float,
+    dy: float,
+    rot_deg: float,
+    segment: str = "distal",
+) -> Image.Image:
+    """
+    Split image by polygon; transform chosen segment (distal=inside polygon) by dx,dy,rot about hinge.
+    Return composited RGBA.
+    """
+    W, H = src_rgba.size
+    mask = polygon_mask((W, H), poly_pts)
+    inv_mask = ImageOps.invert(mask)
+
+    # inside = distal; outside = proximal
+    inside = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    outside = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    inside.paste(src_rgba, (0, 0), mask)
+    outside.paste(src_rgba, (0, 0), inv_mask)
+
+    moving = inside if segment == "distal" else outside
+    fixed  = outside if segment == "distal" else inside
+
+    # rotate around hinge, then translate
+    rot = moving.rotate(rot_deg, resample=Image.BICUBIC, center=hinge, expand=False)
+
+    out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    out.alpha_composite(fixed, (0, 0))
+    out.alpha_composite(rot, (int(round(dx)), int(round(dy))))
+    return out
+
+
+def dist2(a, b) -> float:
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+def line_angle_deg(p0, p1) -> float:
+    """Return 0..180 line angle (screen coords)."""
+    ang = math.degrees(math.atan2(p1[1] - p0[1], p1[0] - p0[0])) % 180
+    return ang
+
+
+def snap_endpoint_to_angle(p0, p1, target_deg, tol_deg) -> Tuple[float, float]:
+    """
+    If p1 is within 'tol_deg' of target_deg (or target+180), snap to that angle keeping the same length.
+    Otherwise return original p1.
+    """
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    if dx == 0 and dy == 0:
+        return p1
+
+    cur = line_angle_deg(p0, p1)
+    # pick nearest (target or target+180)
+    choices = [target_deg % 180, (target_deg + 180) % 180]
+    best = min(choices, key=lambda a: min(abs(a - cur), 180 - abs(a - cur)))
+    delta = min(abs(best - cur), 180 - abs(best - cur))
+    if delta > tol_deg:
+        return p1
+
+    L = math.hypot(dx, dy)
+    ang = math.radians(best)
+    return (p0[0] + L * math.cos(ang), p0[1] + L * math.sin(ang))
+
+
+# -------------------------------
+# Session state model
+# -------------------------------
 ss = st.session_state
 defaults = dict(
-    # image & view
-    dispw=1100, zoom=1.0, show_grid=False,
-    # joint drawing
-    joint_mode="Tangent (2 clicks)",   # or "Freehand (multi-click)"
-    joint_pts=[],                      # in ORIGINAL pixels
-    # axis controls
-    axis_angle_deg=81.0,               # angle relative to joint line
-    axis_origin_mode="Joint center",   # or "Click to set"
-    axis_origin=None,                  # if "Click to set", stored in ORIGINAL pixels
-    axis_line=[],                      # resulting axis line (p0,p1) in ORIGINAL pixels
-    # ghost line
-    guide_on=True, guide_snap5=True, guide_len=400, guide_angle_offset=0.0,
+    tool="Polygon",               # "Joints", "Axes", "Polygon", "Hinge", "Simulate"
+    subtool="Add",                # for joints/axes
+    dispw=1100,                   # display width
+    joints=[],                    # [(x,y)]
+    axes=[],                      # [{"joint": int|None, "p0":(x,y), "p1":(x,y), "label":str}]
+    placing_axis=None,            # {"joint": idx|None, "p0":(x,y)}
+    poly=[],                      # polygon points (original coords)
+    hinge=None,                   # (x,y)
+    snap_on=False,
+    snap_deg=81.0,
+    snap_tol=3.0,
+    hud_text="",                  # live readout
+    click_nonce=0,                # to flush stale clicks when switching tools
 )
-for k,v in defaults.items(): ss.setdefault(k, v)
+for k, v in defaults.items():
+    ss.setdefault(k, v)
 
-# --------------------- sidebar ---------------------
+
+# -------------------------------
+# Sidebar controls
+# -------------------------------
 st.sidebar.header("Upload image")
-up = st.sidebar.file_uploader(" ", type=["png","jpg","jpeg","tif","tiff"])
-if not up:
-    st.info("Upload an X-ray to begin.")
+uploaded = st.sidebar.file_uploader(" ", type=["png", "jpg", "jpeg", "tif", "tiff"])
+
+st.sidebar.markdown("### Display")
+ss.dispw = st.sidebar.slider("Preview width", 600, 1800, int(ss.dispw), 50)
+
+st.sidebar.markdown("### Angle assistance (for axes)")
+ss.snap_on = st.sidebar.checkbox("Constrain axis to angle", value=bool(ss.snap_on))
+ss.snap_deg = float(st.sidebar.number_input("Target angle (deg)", value=float(ss.snap_deg), step=0.5, format="%.1f"))
+ss.snap_tol = float(st.sidebar.slider("Tolerance (deg)", 0.0, 15.0, float(ss.snap_tol), 0.5))
+
+hud = st.sidebar.empty()
+if ss.hud_text:
+    hud.write(ss.hud_text)
+
+cols_btn = st.sidebar.columns(3)
+if cols_btn[0].button("Reset poly"):
+    ss.poly.clear()
+if cols_btn[1].button("Reset axes"):
+    ss.axes.clear(); ss.placing_axis = None
+if cols_btn[2].button("Reset joints/hinge"):
+    ss.joints.clear(); ss.hinge = None
+
+
+# -------------------------------
+# Guard: need an image
+# -------------------------------
+if not uploaded:
+    st.info("Upload an image to begin.")
     st.stop()
 
-ss.dispw = st.sidebar.slider("Preview width", 600, 1800, int(ss.dispw), 50)
-ss.zoom  = st.sidebar.slider("Zoom", 0.5, 4.0, float(ss.zoom), 0.1)
-ss.show_grid = st.sidebar.toggle("Show grid", value=ss.show_grid)
+img = load_rgba(uploaded.getvalue())
+origW, origH = img.size
+scale = min(ss.dispw / float(origW), 1.0)
+dispH = int(round(origH * scale))
+dispW = int(round(origW * scale))
 
-st.sidebar.divider()
-st.sidebar.subheader("Joint line")
-ss.joint_mode = st.sidebar.radio("Mode", ["Tangent (2 clicks)", "Freehand (multi-click)"], index=(0 if ss.joint_mode.startswith("Tangent") else 1))
-col1,col2 = st.sidebar.columns(2)
-if col1.button("Clear joint"): ss.joint_pts.clear()
-if col2.button("Finish freehand"):
-    if ss.joint_mode.startswith("Freehand") and len(ss.joint_pts) >= 2:
-        pass  # nothing extra needed; line will be extended automatically
 
-st.sidebar.divider()
-st.sidebar.subheader("Axis construction")
-ss.axis_angle_deg = st.sidebar.number_input("Angle relative to joint (°)", 0.0, 180.0, float(ss.axis_angle_deg), 0.5)
-ss.axis_origin_mode = st.sidebar.radio("Axis origin", ["Joint center","Click to set"], index=(0 if ss.axis_origin_mode=="Joint center" else 1))
-if st.sidebar.button("Clear axis"):
-    ss.axis_line.clear()
-    ss.axis_origin = None
+def o2c(p):  # original -> canvas
+    return (p[0] * scale, p[1] * scale)
 
-st.sidebar.divider()
-st.sidebar.subheader("Ghost / Guide")
-ss.guide_on = st.sidebar.toggle("Enable ghost line", value=ss.guide_on)
-ss.guide_snap5 = st.sidebar.toggle("Snap guide to 5°", value=ss.guide_snap5)
-ss.guide_angle_offset = st.sidebar.slider("Guide angle offset (°)", -180.0, 180.0, float(ss.guide_angle_offset), 0.5)
-ss.guide_len = st.sidebar.slider("Guide length (px)", 50, 2000, int(ss.guide_len), 10)
 
-# --------------------- image & scale ---------------------
-src = load_rgba(up.getvalue())
-W,H = src.size
-scale = min(ss.dispw/float(W), 1.0)
-dispW, dispH = int(round(W*scale*ss.zoom)), int(round(H*scale*ss.zoom))
-disp = src.resize((dispW, dispH), Image.NEAREST)
-if ss.show_grid:
-    disp = draw_grid(disp, step=max(20, int(50*ss.zoom)))
+def c2o(p):  # canvas -> original
+    return (p[0] / scale, p[1] / scale)
 
-# --------------------- build a preview layer (overlays) ---------------------
-overlay = disp.copy()
-d = ImageDraw.Draw(overlay, "RGBA")
 
-# 1) draw joint line (either tangent or freehand)
-joint_has_line = False
-joint_line_disp = None   # display-space line segment across image bounds
-if len(ss.joint_pts) >= 2:
-    # Use first and last for direction; extend across entire image
-    p0, p1 = ss.joint_pts[0], ss.joint_pts[-1]
-    a, b = extend_inf_line_through_image(
-        to_disp(p0, scale, ss.zoom), to_disp(p1, scale, ss.zoom), dispW, dispH
+# -------------------------------
+# Tool ribbon (always visible)
+# -------------------------------
+left, right = st.columns([1.05, 1])
+
+r0 = left.columns([1.2, 1, 1, 1, 1])
+left.subheader("Live Drawing")
+
+ss.tool = r0[0].radio(
+    "Tool",
+    ["Joints", "Axes", "Polygon", "Hinge", "Simulate"],
+    index=["Joints", "Axes", "Polygon", "Hinge", "Simulate"].index(ss.tool),
+    horizontal=True,
+    label_visibility="collapsed",
+)
+if ss.tool in ("Joints", "Axes"):
+    ss.subtool = r0[1].radio(
+        "Action",
+        ["Add", "Delete"],
+        index=["Add", "Delete"].index(ss.subtool),
+        horizontal=True,
+        label_visibility="collapsed",
     )
-    joint_has_line = True
-    joint_line_disp = (a,b)
-    d.line([a,b], fill=(0,255,255,255), width=2)  # cyan full-width joint line
-    # draw the clicked points too
-    ptsd = [to_disp(p, scale, ss.zoom) for p in ss.joint_pts]
-    for q in ptsd:
-        d.ellipse([q[0]-3,q[1]-3,q[0]+3,q[1]+3], fill=(0,255,255,200))
-
-# 2) axis origin logic
-axis_origin_disp = None
-if ss.axis_origin_mode == "Joint center":
-    if joint_has_line:
-        # midpoint of the two display endpoints, convert back to original for storage
-        (ax0,ay0),(ax1,ay1) = joint_line_disp
-        mid_disp = ((ax0+ax1)/2.0, (ay0+ay1)/2.0)
-        axis_origin_disp = mid_disp
-        ss.axis_origin = to_orig(mid_disp, scale, ss.zoom)
 else:
-    # "Click to set" — user will click on the image; if set, draw a crosshair
-    if ss.axis_origin is not None:
-        axis_origin_disp = to_disp(ss.axis_origin, scale, ss.zoom)
+    r0[1].markdown("&nbsp;")
 
-# 3) ghost / guide line
-def draw_ghost(origin_disp, base_angle_rad):
-    """Draw ghost from origin with angle=base±offset and length guide_len."""
-    if not ss.guide_on: return
-    offset = ss.guide_angle_offset
-    if ss.guide_snap5:
-        offset = round(offset/5.0)*5.0
-    th = base_angle_rad - math.radians(offset)  # clockwise positive (screen coords)
-    x0,y0 = origin_disp
-    x1 = x0 + ss.guide_len * math.cos(th)
-    y1 = y0 + ss.guide_len * math.sin(th)
-    d.line([(x0,y0),(x1,y1)], fill=(255,200,0,220), width=2)
-    draw_crosshair(overlay, origin_disp, size=16, alpha=180)
-    # small HUD
-    d.rectangle([10, 10, 280, 58], fill=(0,0,0,150))
-    txt = f"guide angle offset {offset:.1f}°, length {ss.guide_len}px"
-    d.text((18,20), txt, fill=(255,255,255,240))
+right.subheader("Preview / Simulation")
 
-# base angle is joint line angle
-if joint_has_line:
-    (ja0,ja1) = joint_line_disp
-    base_ang = math.atan2(ja1[1]-ja0[1], ja1[0]-ja0[0])      # radians, display space
-else:
-    base_ang = 0.0
 
-# axis construction angle: “axis_angle_deg” relative to the joint line (normal/oblique)
-# axis direction angle in display space:
-axis_dir_disp_rad = base_ang - math.radians(ss.axis_angle_deg)
+# -------------------------------
+# Build overlay (left panel)
+# -------------------------------
+overlay = img.resize((dispW, dispH), Image.NEAREST).copy()
+draw = ImageDraw.Draw(overlay, "RGBA")
 
-# draw ghost if possible
-if axis_origin_disp is not None:
-    draw_ghost(axis_origin_disp, axis_dir_disp_rad)
+# Draw persisted polygon
+if len(ss.poly) >= 2:
+    pts_c = [o2c(p) for p in ss.poly]
+    draw.line(pts_c, fill=(0, 255, 255, 255), width=2)
+    if len(ss.poly) >= 3 and ss.poly[0] == ss.poly[-1]:
+        draw.polygon(pts_c, outline=(0, 255, 255, 255), fill=(0, 255, 255, 35))
 
-# --------------------- click handling ---------------------
-# (we capture clicks on the overlay image with visual guides drawn)
-click = streamlit_image_coordinates(overlay.convert("RGB"), width=dispW, key="click-main")
+# Draw joints
+for (jx, jy) in ss.joints:
+    x, y = o2c((jx, jy))
+    draw.ellipse([x - 5, y - 5, x + 5, y + 5], outline=(255, 215, 0, 255), width=2)
 
+# Draw axes
+for ax in ss.axes:
+    draw.line([o2c(ax["p0"]), o2c(ax["p1"])], fill=(66, 133, 244, 255), width=3)
+
+# Draw hinge
+if ss.hinge:
+    x, y = o2c(ss.hinge)
+    draw.ellipse([x - 7, y - 7, x + 7, y + 7], outline=(255, 165, 0, 255), width=3)
+    draw.line([(x - 12, y), (x + 12, y)], fill=(255, 165, 0, 255), width=1)
+    draw.line([(x, y - 12), (x, y + 12)], fill=(255, 165, 0, 255), width=1)
+
+# Ghost (axis placement)
+if ss.tool == "Axes" and ss.placing_axis is not None:
+    p0 = ss.placing_axis["p0"]
+    # draw a faint crosshair on the origin
+    cx, cy = o2c(p0)
+    draw.line([(cx - 10, cy), (cx + 10, cy)], fill=(180, 180, 255, 200), width=1)
+    draw.line([(cx, cy - 10), (cx, cy + 10)], fill=(180, 180, 255, 200), width=1)
+
+# Display + capture click (always RGB here to avoid JPEG plugin errors)
+click = streamlit_image_coordinates(overlay.convert("RGB"), width=dispW, key=f"click-{ss.click_nonce}")
+
+xo = yo = None
 if click and "x" in click and "y" in click:
-    p_disp = (float(click["x"]), float(click["y"]))
-    p = to_orig(p_disp, scale, ss.zoom)
+    xo, yo = c2o((float(click["x"]), float(click["y"])))
 
-    # If axis origin mode is "Click to set", set/replace it
-    if ss.axis_origin_mode == "Click to set":
-        ss.axis_origin = p
 
-    # Joint drawing modes
-    if ss.joint_mode.startswith("Tangent"):
-        # Two clicks define tangent; third click restarts
-        if len(ss.joint_pts) == 0:
-            ss.joint_pts = [p]
-        elif len(ss.joint_pts) == 1:
-            ss.joint_pts.append(p)
-        else:
-            ss.joint_pts = [p]
+# -------------------------------
+# Handle clicks for each tool
+# -------------------------------
+# Note: we never draw any blocking tooltip on the image;
+# live data goes to the sidebar HUD (hud.write).
+
+if ss.tool == "Joints":
+    if ss.subtool == "Add" and xo is not None:
+        ss.joints.append((xo, yo))
+    elif ss.subtool == "Delete" and xo is not None and ss.joints:
+        j = int(np.argmin([dist2((xo, yo), p) for p in ss.joints]))
+        if math.hypot(xo - ss.joints[j][0], yo - ss.joints[j][1]) < 25 / scale:
+            ss.joints.pop(j)
+
+elif ss.tool == "Axes":
+    if ss.subtool == "Delete" and xo is not None and ss.axes:
+        # delete nearest axis by distance to its midpoint
+        mids = [((ax["p0"][0] + ax["p1"][0]) / 2, (ax["p0"][1] + ax["p1"][1]) / 2) for ax in ss.axes]
+        k = int(np.argmin([dist2((xo, yo), m) for m in mids]))
+        if math.hypot(xo - mids[k][0], yo - mids[k][1]) < 30 / scale:
+            ss.axes.pop(k)
     else:
-        # Freehand (multi-click). Each click adds a vertex; finish with the button.
-        ss.joint_pts.append(p)
+        # Add: two clicks, with ghost and angle assist
+        if ss.placing_axis is None and xo is not None:
+            # bind to nearest joint if inside 30 px
+            bind_idx = None
+            if ss.joints:
+                j = int(np.argmin([dist2((xo, yo), p) for p in ss.joints]))
+                if math.hypot(xo - ss.joints[j][0], yo - ss.joints[j][1]) < 30 / scale:
+                    bind_idx = j
+                    p0 = ss.joints[j]
+                else:
+                    p0 = (xo, yo)
+            else:
+                p0 = (xo, yo)
+            ss.placing_axis = {"joint": bind_idx, "p0": p0}
 
-    # Once we have a joint line and an origin, build the axis line immediately
-    if len(ss.joint_pts) >= 2 and ss.axis_origin is not None:
-        # axis from origin at axis_dir (computed in DISPLAY), so convert to ORIGINAL
-        # length: span image; make a long segment and then extend to bounds
-        origin_disp = to_disp(ss.axis_origin, scale, ss.zoom)
-        x0,y0 = origin_disp
-        x1 = x0 + ss.guide_len * math.cos(axis_dir_disp_rad)
-        y1 = y0 + ss.guide_len * math.sin(axis_dir_disp_rad)
-        # extend across display image bounds
-        a_disp, b_disp = extend_inf_line_through_image((x0,y0),(x1,y1), dispW, dispH)
-        # store in ORIGINAL pixels
-        ss.axis_line = [to_orig(a_disp, scale, ss.zoom), to_orig(b_disp, scale, ss.zoom)]
+        elif ss.placing_axis is not None:
+            p0 = ss.placing_axis["p0"]
+            # ghost endpoint follows cursor; snap if enabled
+            # We use current mouse position as ghost even if click is None
+            # so compute mouse position from last image-coordinates payload
+            if click and "x" in click and "y" in click:
+                ghost = (xo, yo)
+                if ss.snap_on:
+                    ghost = snap_endpoint_to_angle(p0, ghost, ss.snap_deg, ss.snap_tol)
+                # draw ghost on top
+                g0, g1 = o2c(p0), o2c(ghost)
+                g_overlay = img.resize((dispW, dispH), Image.NEAREST).copy()
+                g_draw = ImageDraw.Draw(g_overlay, "RGBA")
+                g_draw.line([g0, g1], fill=(66, 133, 244, 200), width=3)
+                # show angle readout
+                hud.write(
+                    f"axis angle **{line_angle_deg(p0, ghost):.1f}°**, length **{math.hypot(ghost[0]-p0[0], ghost[1]-p0[1]):.0f}px**"
+                )
+                # replace the left image temporarily (no extra click needed)
+                left.image(g_overlay, use_column_width=False, width=dispW)
+            # confirm on actual click event
+            if xo is not None:
+                end = (xo, yo)
+                if ss.snap_on:
+                    end = snap_endpoint_to_angle(p0, end, ss.snap_deg, ss.snap_tol)
+                ss.axes.append({"joint": ss.placing_axis["joint"], "p0": p0, "p1": end, "label": f"AX{len(ss.axes)+1}"})
+                ss.placing_axis = None
 
-# --------------------- final preview ---------------------
-final = disp.copy()
-fd = ImageDraw.Draw(final, "RGBA")
+elif ss.tool == "Polygon":
+    # click to add; snap-close if near first point
+    if xo is not None:
+        pts = ss.poly + [(xo, yo)]
+        if len(pts) >= 3 and math.hypot(pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]) < 12 / scale:
+            pts[-1] = pts[0]  # close loop
+        ss.poly = pts
 
-# redraw joint (full width)
-if joint_line_disp is not None:
-    fd.line(list(joint_line_disp), fill=(0,255,255,255), width=2)
+elif ss.tool == "Hinge":
+    if xo is not None:
+        ss.hinge = (xo, yo)
 
-# redraw joint clicks
-for q in [to_disp(p, scale, ss.zoom) for p in ss.joint_pts]:
-    fd.ellipse([q[0]-3,q[1]-3,q[0]+3,q[1]+3], fill=(0,255,255,200))
+# If a tool change happened earlier, this prevents reusing a stale click
+# (not strictly necessary here but kept for safety)
+if ss.tool in ("Joints", "Axes", "Polygon", "Hinge"):
+    ss.click_nonce += 0  # no-op to make code explicit
 
-# axis origin marker
-if ss.axis_origin is not None:
-    draw_crosshair(final, to_disp(ss.axis_origin, scale, ss.zoom), size=18, alpha=200)
 
-# axis line
-if len(ss.axis_line) == 2:
-    fd.line([to_disp(ss.axis_line[0], scale, ss.zoom), to_disp(ss.axis_line[1], scale, ss.zoom)],
-            fill=(66,133,244,255), width=3)
-
-st.image(final, width=dispW, caption="Angle-assisted axes (joint + axis)")
-
-st.caption("Tips: Choose 'Tangent (2 clicks)' for fast joint line, 'Freehand' for curved/irregular joints. "
-           "Pick axis origin as 'Joint center' or click to set. The ghost line shows the axis direction before committing.")
+# -------------------------------
+# Right panel: Preview / Simulation
+# -------------------------------
+if ss.tool == "Simulate" and len(ss.poly) >= 3 and ss.poly[0] == ss.poly[-1] and ss.hinge:
+    segment = right.radio("Move segment", ["distal", "proximal"], horizontal=True)
+    dx = right.slider("ΔX (px)", -1000, 1000, 0, 1)
+    dy = right.slider("ΔY (px)", -1000, 1000, 0, 1)
+    theta = right.slider("Rotate (deg)", -180, 180, 0, 1)
+    out = apply_osteotomy(img, ss.poly, ss.hinge, dx, dy, theta, segment)
+    right.image(out.resize((dispW, dispH), Image.NEAREST), use_column_width=False)
+else:
+    # show same overlay (no blocking labels)
+    right.image(overlay, use_column_width=False, width=dispW)
