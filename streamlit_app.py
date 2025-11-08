@@ -98,75 +98,90 @@ def _polygon_points_from_obj(obj, scale):
 def safe_st_canvas(*, background_image, width, height, drawing_mode,
                    stroke_color, stroke_width, key):
     """
-    Calls st_canvas but tolerates version differences:
-      - Try with display_ratio=1.0 (+ numpy background)
-      - Try without display_ratio
-      - Try with PIL.Image background
-      - Fallback to polyline if polygon mode unsupported
+    Calls st_canvas while tolerating version differences:
+      - Tries with/without display_ratio
+      - Tries with/without background_color
+      - Drops update_streamlit if not supported
+      - Falls back from 'polygon' -> 'polyline' if needed
+      - Works with NumPy or PIL backgrounds
     """
     bg = background_image
     dm = drawing_mode
 
-    def _call(**k):
-        # most reliable combo first
-        try:
-            return st_canvas(display_ratio=1.0, **k)
-        except TypeError:
-            return st_canvas(**k)
+    # build the most expressive kwargs first, then progressively prune them
+    base = dict(
+        background_image=bg,
+        width=width,
+        height=height,
+        drawing_mode=dm,
+        stroke_color=stroke_color,
+        stroke_width=stroke_width,
+        key=key,
+    )
 
-    # 1) numpy + requested mode
-    try:
-        return _call(background_image=bg, width=width, height=height,
-                     drawing_mode=dm, stroke_color=stroke_color,
-                     stroke_width=stroke_width, key=key,
-                     background_color="#ffffff", update_streamlit=True)
-    except Exception:
-        pass
+    # variants we’ll try in order (we mutate copies so we can strip unsupported args)
+    variants = []
 
-    # 2) numpy + polyline (if polygon not supported)
-    if dm == "polygon":
-        try:
-            return _call(background_image=bg, width=width, height=height,
-                         drawing_mode="polyline", stroke_color=stroke_color,
-                         stroke_width=stroke_width, key=key,
-                         background_color="#ffffff", update_streamlit=True)
-        except Exception:
-            pass
+    # 1) with display_ratio and background_color and update_streamlit
+    v = base.copy(); v["display_ratio"] = 1.0; v["background_color"] = "#ffffff"; v["update_streamlit"] = True
+    variants.append(v)
 
-    # 3) PIL background
-    if isinstance(bg, np.ndarray):
-        try:
-            bg_pil = Image.fromarray(bg)
-        except Exception:
-            bg_pil = None
-    else:
-        bg_pil = bg
+    # 2) drop update_streamlit
+    v = base.copy(); v["display_ratio"] = 1.0; v["background_color"] = "#ffffff"
+    variants.append(v)
 
-    if bg_pil is not None:
-        # 3a) PIL + requested mode
-        try:
-            return _call(background_image=bg_pil, width=width, height=height,
-                         drawing_mode=dm, stroke_color=stroke_color,
-                         stroke_width=stroke_width, key=key,
-                         background_color="#ffffff", update_streamlit=True)
-        except Exception:
-            pass
-        # 3b) PIL + polyline
-        if dm == "polygon":
+    # 3) drop background_color
+    v = base.copy(); v["display_ratio"] = 1.0
+    variants.append(v)
+
+    # 4) drop display_ratio too (old builds)
+    v = base.copy()
+    variants.append(v)
+
+    # if we’re asking for polygon and it fails, we’ll also try again with polyline
+    def _try_variants(variants_list):
+        for kwargs in variants_list:
             try:
-                return _call(background_image=bg_pil, width=width, height=height,
-                             drawing_mode="polyline", stroke_color=stroke_color,
-                             stroke_width=stroke_width, key=key,
-                             background_color="#ffffff", update_streamlit=True)
+                return st_canvas(**kwargs)
+            except TypeError:
+                # unsupported kw present — strip it and retry
+                for bad in ("update_streamlit", "display_ratio", "background_color"):
+                    if bad in kwargs:
+                        kwargs = {k:v for k,v in kwargs.items() if k != bad}
+                        try:
+                            return st_canvas(**kwargs)
+                        except TypeError:
+                            continue
+                # move to next variant
+                continue
             except Exception:
-                pass
+                continue
+        raise RuntimeError("st_canvas could not be called with any supported signature.")
 
-    # final fallback: create a blank white background (should never be reached)
-    blank = np.ones((height, width, 3), dtype=np.uint8) * 255
-    return _call(background_image=blank, width=width, height=height,
-                 drawing_mode="polyline" if dm == "polygon" else dm,
-                 stroke_color=stroke_color, stroke_width=stroke_width,
-                 key=key, background_color="#ffffff", update_streamlit=True)
+    try:
+        return _try_variants(variants)
+    except RuntimeError:
+        # fallback to polyline if polygon isn’t supported
+        if dm == "polygon":
+            for v in variants:
+                v["drawing_mode"] = "polyline"
+            return _try_variants(variants)
+        # final fallback: convert NumPy->PIL or vice versa and try again
+        try:
+            from PIL import Image as _PIL
+            if isinstance(bg, np.ndarray):
+                bg2 = _PIL.fromarray(bg)
+            else:
+                bg2 = np.array(bg)
+            for v in variants:
+                v["background_image"] = bg2
+            return _try_variants(variants)
+        except Exception:
+            # last resort: blank white background
+            blank = np.ones((height, width, 3), dtype=np.uint8) * 255
+            for v in variants:
+                v["background_image"] = blank
+            return _try_variants(variants)
 
 # ---------- state ----------
 ss = st.session_state
