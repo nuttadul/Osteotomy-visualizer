@@ -223,8 +223,13 @@ for ax in ss.axes:
             angles_sidebar.append((ax["segment"], acute, obtuse))
 
 # ---------- SHOW SINGLE IMAGE & CAPTURE CLICKS ----------
-st.image(disp, use_column_width=False, width=dispW)
-click = streamlit_image_coordinates(disp.convert("RGB"), width=dispW, key=f"click-{ss.click_nonce}")
+
+disp_rgb = disp.convert("RGB")          # image-coordinates wants RGB (no alpha)
+click = streamlit_image_coordinates(
+    disp_rgb,
+    width=dispW,
+    key=f"click-{ss.click_nonce}"
+)
 xo=yo=None
 if click and "x" in click and "y" in click:
     xo,yo = c2o((float(click["x"]), float(click["y"])))
